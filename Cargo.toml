@@ -1,0 +1,9 @@
+[package]
+name = "dragndrop"
+version = "0.1.0"
+edition = "2024"
+authors = ["Saad Moazzam"]
+
+[dependencies]
+bevy = {version = "0.15.3", features = ["trace"]}
+bevy_panorbit_camera = "0.25.0"
