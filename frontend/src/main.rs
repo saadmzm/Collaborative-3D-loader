@@ -1,4 +1,4 @@
-use dragndrop::run;
+use frontend::run;
 
 fn main() {
     run();
