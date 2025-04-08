@@ -3,7 +3,12 @@ name = "dragndrop"
 version = "0.1.0"
 edition = "2024"
 authors = ["Saad Moazzam"]
+rust-version = "1.85.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bevy = {version = "0.15.3", features = ["trace"]}
+bevy = "0.15.3"
 bevy_panorbit_camera = "0.25.0"
+rusqlite = "0.34.0"  # Added for SQLite integration
