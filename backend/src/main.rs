@@ -7,7 +7,8 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 // Message formats for WebSocket communication
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
-    id: i32,
+    action: String, // "get_by_id" or "get_all"
+    id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,9 +26,8 @@ struct ModelData {
 
 #[tokio::main]
 async fn main() {
-    // Start WebSocket server
-    let listener = TcpListener::bind("127.0.0.1:8000").await.expect("Failed to bind");
-    println!("Backend WebSocket server running on ws://127.0.0.1:8000/ws");
+    let listener = TcpListener::bind("17.76.57.76:8000").await.expect("Failed to bind");
+    println!("Backend WebSocket server running on ws://17.76.57.76:8000/ws");
 
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(handle_connection(stream));
@@ -42,37 +42,78 @@ async fn handle_connection(stream: TcpStream) {
 
     while let Some(Ok(message)) = read.next().await {
         if let Message::Text(text) = message {
-            // Parse incoming request
             match serde_json::from_str::<ModelRequest>(&text) {
                 Ok(request) => {
-                    // Fetch model from database
-                    match load_model_by_id(request.id) {
-                        Ok(model) => {
-                            let response = ModelResponse {
-                                id: model.id,
-                                path: model.path,
-                            };
-                            // Send response
-                            if let Err(e) = write
-                                .send(Message::Text(
-                                    serde_json::to_string(&response).expect("Failed to serialize response"),
-                                ))
-                                .await
-                            {
-                                eprintln!("Failed to send response: {}", e);
-                                break;
+                    match request.action.as_str() {
+                        "get_by_id" => {
+                            if let Some(id) = request.id {
+                                match load_model_by_id(id) {
+                                    Ok(model) => {
+                                        let response = ModelResponse {
+                                            id: model.id,
+                                            path: model.path,
+                                        };
+                                        if let Err(e) = write
+                                            .send(Message::Text(
+                                                serde_json::to_string(&response)
+                                                    .expect("Failed to serialize response"),
+                                            ))
+                                            .await
+                                        {
+                                            eprintln!("Failed to send response: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to load model: {}", e);
+                                        let error_response = serde_json::to_string(&serde_json::json!({
+                                            "error": format!("Model not found: {}", e)
+                                        }))
+                                        .expect("Failed to serialize error");
+                                        if let Err(e) = write.send(Message::Text(error_response)).await {
+                                            eprintln!("Failed to send error response: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to load model: {}", e);
-                            let error_response = serde_json::to_string(&serde_json::json!({
-                                "error": format!("Model not found: {}", e)
-                            }))
-                            .expect("Failed to serialize error");
-                            if let Err(e) = write.send(Message::Text(error_response)).await {
-                                eprintln!("Failed to send error response: {}", e);
-                                break;
+                        "get_all" => {
+                            match load_all_models() {
+                                Ok(models) => {
+                                    let response: Vec<ModelResponse> = models
+                                        .into_iter()
+                                        .map(|m| ModelResponse {
+                                            id: m.id,
+                                            path: m.path,
+                                        })
+                                        .collect();
+                                    if let Err(e) = write
+                                        .send(Message::Text(
+                                            serde_json::to_string(&response)
+                                                .expect("Failed to serialize response"),
+                                        ))
+                                        .await
+                                    {
+                                        eprintln!("Failed to send response: {}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load models: {}", e);
+                                    let error_response = serde_json::to_string(&serde_json::json!({
+                                        "error": format!("Failed to load models: {}", e)
+                                    }))
+                                    .expect("Failed to serialize error");
+                                    if let Err(e) = write.send(Message::Text(error_response)).await {
+                                        eprintln!("Failed to send error response: {}", e);
+                                        break;
+                                    }
+                                }
                             }
+                        }
+                        _ => {
+                            eprintln!("Unknown action: {}", request.action);
                         }
                     }
                 }
@@ -84,7 +125,6 @@ async fn handle_connection(stream: TcpStream) {
     }
 }
 
-// Initialize database
 fn init_db() -> Result<Connection> {
     let conn = Connection::open("models.db")?;
     conn.execute(
@@ -97,7 +137,6 @@ fn init_db() -> Result<Connection> {
     Ok(conn)
 }
 
-// Load model by ID from database
 fn load_model_by_id(model_id: i32) -> Result<ModelData> {
     let conn = init_db()?;
     let mut stmt = conn.prepare("SELECT id, path FROM models WHERE id = ?1")?;
@@ -108,4 +147,20 @@ fn load_model_by_id(model_id: i32) -> Result<ModelData> {
         })
     })?;
     Ok(model_data)
+}
+
+fn load_all_models() -> Result<Vec<ModelData>> {
+    let conn = init_db()?;
+    let mut stmt = conn.prepare("SELECT id, path FROM models")?;
+    let model_iter = stmt.query_map(params![], |row| {
+        Ok(ModelData {
+            id: row.get(0)?,
+            path: row.get(1)?,
+        })
+    })?;
+    let mut models = Vec::new();
+    for model in model_iter {
+        models.push(model?);
+    }
+    Ok(models)
 }
