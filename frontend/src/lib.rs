@@ -4,8 +4,7 @@ use bevy::{
 };
 use bevy_panorbit_camera::{PanOrbitCameraPlugin, PanOrbitCamera};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt}; // Import SinkExt and StreamExt
 
 // Message format for WebSocket communication
@@ -56,7 +55,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 
     // Fetch model data via WebSocket
-    let model_id = 5; // Replace with desired ID
+    let model_id = 2; // Replace with desired ID
     match fetch_model_by_id(model_id) {
         Ok(model) => {
             commands.spawn(SceneRoot(asset_server.load(
@@ -82,7 +81,7 @@ fn fetch_model_by_id(model_id: i32) -> Result<ModelResponse, String> {
 
     rt.block_on(async {
         // Connect to the WebSocket server
-        let (mut ws_stream, _) = connect_async("ws://17.76.57.76:8000/ws")
+        let (mut ws_stream, _) = connect_async("ws://127.0.0.1:8000/ws")
             .await
             .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
 

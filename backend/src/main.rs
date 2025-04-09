@@ -26,8 +26,8 @@ struct ModelData {
 #[tokio::main]
 async fn main() {
     // Start WebSocket server
-    let listener = TcpListener::bind("17.76.57.76:8000").await.expect("Failed to bind");
-    println!("Backend WebSocket server running on ws://17.76.57.76:8000/ws");
+    let listener = TcpListener::bind("127.0.0.1:8000").await.expect("Failed to bind");
+    println!("Backend WebSocket server running on ws://127.0.0.1:8000/ws");
 
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(handle_connection(stream));

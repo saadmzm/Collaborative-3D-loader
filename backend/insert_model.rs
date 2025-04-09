@@ -11,8 +11,10 @@ fn main() -> Result<()> {
     )?;
     let models = vec![
         (1, "models/tree.gltf"),
-        (2, "models/house.gltf"),
-        (5, "models/car.gltf"),
+        (2, "models/bridge.gltf"),
+        (3, "models/helix_bridge/scene.gltf"),
+        (4, "models/blue_eyeball_free/scene.gltf"),
+        (5, "models/2020_bmw_m8_coupe/scene.gltf"),
     ];
     for (id, path) in models {
         conn.execute("INSERT OR REPLACE INTO models (id, path) VALUES (?1, ?2)", params![id, path])?;
