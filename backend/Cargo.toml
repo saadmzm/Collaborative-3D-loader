@@ -6,7 +6,7 @@ authors = ["Saad Moazzam"]
 default-run = "backend"
 
 [dependencies]
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 tokio-tungstenite = "0.24.0"
 rusqlite = "0.34.0"
 serde = { version = "1.0.219", features = ["derive"] }

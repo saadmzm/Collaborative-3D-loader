@@ -5,29 +5,37 @@ use bevy::{
 use bevy_panorbit_camera::{PanOrbitCameraPlugin, PanOrbitCamera};
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 
-// Message formats for WebSocket communication
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
-    action: String, // "get_by_id" or "get_all"
-    id: Option<i32>, // Used for get_by_id
+    action: String,
+    id: Option<i32>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct ModelResponse {
     id: i32,
     path: String,
 }
 
-// Resource to store available models and selected model
 #[derive(Resource)]
 struct ModelState {
     models: Vec<ModelResponse>,
     selected_model_id: Option<i32>,
     current_entity: Option<Entity>,
 }
+
+#[derive(Resource)]
+struct ModelUpdateReceiver(mpsc::Receiver<Vec<ModelResponse>>);
+
+#[derive(Resource)]
+struct WebSocketCommandSender(mpsc::Sender<String>);
+
+#[derive(Resource)]
+struct RefreshTimer(Timer); // New timer resource for automatic refresh
 
 pub fn run() {
     App::new()
@@ -42,13 +50,12 @@ pub fn run() {
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, ui_system)
+        .add_systems(Update, (ui_system, handle_model_updates))
         .add_systems(Startup, debug_resources)
         .run();
 }
 
-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    // Spawn the camera and light
+fn setup(mut commands: Commands) {
     commands.spawn((
         Transform::from_translation(Vec3::new(-6.0, 5.0, 1.5)),
         PanOrbitCamera::default(),
@@ -67,37 +74,93 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         .build(),
     ));
 
-    // Fetch all models and initialize state
-    match fetch_all_models() {
-        Ok(models) => {
-            let initial_model = models.get(0).cloned();
-            let initial_entity = initial_model.clone().map(|model| {
-                commands
-                    .spawn(SceneRoot(asset_server.load(
-                        GltfAssetLabel::Scene(0).from_asset(model.path.clone()),
-                    )))
-                    .id()
-            });
-            commands.insert_resource(ModelState {
-                models,
-                selected_model_id: initial_model.map(|m| m.id),
-                current_entity: initial_entity,
-            });
-        }
-        Err(e) => {
-            error!("Failed to fetch models from backend: {:?}", e);
-            let entity = commands
-                .spawn(SceneRoot(asset_server.load(
-                    GltfAssetLabel::Scene(0).from_asset("models/tree.gltf"),
-                )))
-                .id();
-            commands.insert_resource(ModelState {
-                models: vec![],
-                selected_model_id: None,
-                current_entity: Some(entity),
-            });
-        }
-    }
+    // Initialize ModelState with an empty list
+    commands.insert_resource(ModelState {
+        models: vec![],
+        selected_model_id: None,
+        current_entity: None,
+    });
+
+    // Initialize RefreshTimer (30 Hz = 1/30 seconds)
+    commands.insert_resource(RefreshTimer(Timer::new(
+        std::time::Duration::from_secs_f32(1.0 / 30.0),
+        TimerMode::Repeating,
+    )));
+
+    // Set up channels
+    let (update_tx, update_rx) = mpsc::channel(16);
+    let (command_tx, mut command_rx) = mpsc::channel(16);
+    commands.insert_resource(ModelUpdateReceiver(update_rx));
+    commands.insert_resource(WebSocketCommandSender(command_tx));
+
+    // Spawn WebSocket thread
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime");
+
+        rt.block_on(async {
+            info!("Starting WebSocket listener thread");
+            match connect_async("ws://127.0.0.1:8000/ws").await {
+                Ok((mut ws_stream, _)) => {
+                    info!("WebSocket connected successfully");
+
+                    // Send initial "get_all" request
+                    let request = ModelRequest {
+                        action: "get_all".to_string(),
+                        id: None,
+                    };
+                    if let Err(e) = ws_stream.send(Message::Text(serde_json::to_string(&request).unwrap())).await {
+                        error!("Failed to send initial get_all request: {}", e);
+                        return;
+                    }
+                    info!("Sent initial get_all request");
+
+                    loop {
+                        tokio::select! {
+                            Some(message_result) = ws_stream.next() => {
+                                match message_result {
+                                    Ok(Message::Text(text)) => {
+                                        info!("Received WebSocket message: {}", text);
+                                        if let Ok(models) = serde_json::from_str::<Vec<ModelResponse>>(&text) {
+                                            info!("Parsed model list: {:?}", models);
+                                            if let Err(e) = update_tx.send(models).await {
+                                                error!("Failed to send models to channel: {}", e);
+                                                break;
+                                            }
+                                        } else if let Ok(model) = serde_json::from_str::<ModelResponse>(&text) {
+                                            info!("Parsed single model: ID={}, Path={}", model.id, model.path);
+                                            if let Err(e) = update_tx.send(vec![model]).await {
+                                                error!("Failed to send single model to channel: {}", e);
+                                                break;
+                                            }
+                                        } else {
+                                            warn!("Failed to parse WebSocket message: {}", text);
+                                        }
+                                    }
+                                    Ok(_) => info!("Received non-text message, ignoring"),
+                                    Err(e) => {
+                                        error!("WebSocket error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(command) = command_rx.recv() => {
+                                info!("Received command from UI: {}", command);
+                                if let Err(e) = ws_stream.send(Message::Text(command)).await {
+                                    error!("Failed to send command to WebSocket: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    error!("WebSocket connection closed unexpectedly");
+                }
+                Err(e) => error!("Failed to connect to WebSocket: {}", e),
+            }
+        });
+    });
 }
 
 fn ui_system(
@@ -105,39 +168,46 @@ fn ui_system(
     mut state: ResMut<ModelState>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    command_sender: Res<WebSocketCommandSender>,
+    time: Res<Time>,
+    mut refresh_timer: ResMut<RefreshTimer>,
 ) {
     egui::Window::new("Model Selector").show(contexts.ctx_mut(), |ui| {
-        let selected_id = state.selected_model_id.unwrap_or(-1); // -1 for "None"
+        let selected_id = state.selected_model_id.unwrap_or(-1);
         let mut new_selected_id = selected_id;
 
-        egui::ComboBox::from_label("Select Model")
-            .selected_text(
-                state
-                    .models
-                    .iter()
-                    .find(|m| m.id == selected_id)
-                    .map_or("None".to_string(), |m| format!("ID: {} - {}", m.id, m.path)),
-            )
-            .show_ui(ui, |ui| {
-                for model in &state.models {
-                    ui.selectable_value(
-                        &mut new_selected_id,
-                        model.id,
-                        format!("ID: {} - {}", model.id, model.path), // Fixed: m.path -> model.path
-                    );
-                }
-            });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Select Model")
+                .selected_text(
+                    state
+                        .models
+                        .iter()
+                        .find(|m| m.id == selected_id)
+                        .map_or("None".to_string(), |m| format!("ID: {} - {}", m.id, m.path)),
+                )
+                .show_ui(ui, |ui| {
+                    for model in &state.models {
+                        ui.selectable_value(
+                            &mut new_selected_id,
+                            model.id,
+                            format!("ID: {} - {}", model.id, model.path),
+                        );
+                    }
+                });
+        });
 
-        // Update model if selection changed
+        // Automatic refresh at 30 Hz
+        refresh_timer.0.tick(time.delta());
+        if refresh_timer.0.just_finished() {
+            info!("Automatic refresh triggered (30 Hz), sending get_all request");
+            send_get_all_request(&command_sender);
+        }
+
         if new_selected_id != selected_id {
             state.selected_model_id = Some(new_selected_id);
-
-            // Despawn the current model if it exists
             if let Some(entity) = state.current_entity {
                 commands.entity(entity).despawn();
             }
-
-            // Spawn the new model
             if let Some(model) = state.models.iter().find(|m| m.id == new_selected_id) {
                 let new_entity = commands
                     .spawn(SceneRoot(asset_server.load(
@@ -150,52 +220,29 @@ fn ui_system(
     });
 }
 
-// Debug system to check resource availability
+// Helper function to send "get_all" request
+fn send_get_all_request(command_sender: &WebSocketCommandSender) {
+    let request = ModelRequest {
+        action: "get_all".to_string(),
+        id: None,
+    };
+    let request_str = serde_json::to_string(&request).unwrap();
+    if let Err(e) = command_sender.0.try_send(request_str) {
+        error!("Failed to send get_all request: {}", e);
+    }
+}
+
+fn handle_model_updates(mut state: ResMut<ModelState>, mut receiver: ResMut<ModelUpdateReceiver>) {
+    while let Ok(models) = receiver.0.try_recv() {
+        info!("Updating ModelState with: {:?}", models);
+        state.models = models;
+    }
+}
+
 fn debug_resources(world: &World) {
     if world.get_resource::<Assets<Shader>>().is_some() {
         info!("Assets<Shader> resource is available");
     } else {
         error!("Assets<Shader> resource is NOT available");
     }
-}
-
-// Fetch all models from the backend
-fn fetch_all_models() -> Result<Vec<ModelResponse>, String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to create runtime: {}", e))?;
-
-    rt.block_on(async {
-        let (mut ws_stream, _) = connect_async("ws://127.0.0.1:8000/ws")
-            .await
-            .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
-
-        // Send request for all models
-        let request = ModelRequest {
-            action: "get_all".to_string(),
-            id: None,
-        };
-        ws_stream
-            .send(Message::Text(
-                serde_json::to_string(&request).map_err(|e| format!("Failed to serialize request: {}", e))?,
-            ))
-            .await
-            .map_err(|e| format!("Failed to send request:fonso {}", e))?;
-
-        // Receive response
-        if let Some(message) = ws_stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|e| format!("Failed to receive response: {}", e))?
-        {
-            if let Message::Text(text) = message {
-                let response: Vec<ModelResponse> = serde_json::from_str(&text)
-                    .map_err(|e| format!("Failed to deserialize response: {}", e))?;
-                return Ok(response);
-            }
-        }
-        Err("No valid response received".to_string())
-    })
 }
