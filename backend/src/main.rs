@@ -1,11 +1,12 @@
-use futures_util::{SinkExt, StreamExt};
-use rusqlite::{params, Connection, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast::{self, Sender};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use futures_util::{ SinkExt, StreamExt };
+use rusqlite::{ params, Connection, Result };
+use serde::{ Deserialize, Serialize };
+use std::{ collections::HashSet, time::Duration };
+use tokio::{
+    net::{ TcpListener, TcpStream },
+    sync::broadcast::{ self, Sender }
+};
+use tokio_tungstenite::{ accept_async, tungstenite::Message };
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
@@ -33,7 +34,6 @@ async fn main() {
 
     let (tx, _) = broadcast::channel(16);
 
-    // Spawn a task to poll the database for changes
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let mut last_models: HashSet<ModelResponse> = HashSet::new();
@@ -56,7 +56,7 @@ async fn main() {
                 }
                 Err(e) => eprintln!("Failed to poll models: {}", e),
             }
-            tokio::time::sleep(Duration::from_secs(2)).await; // Poll every 2 seconds
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
@@ -88,7 +88,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             path: model.path,
                                         };
                                         write
-                                            .send(Message::Text(serde_json::to_string(&response).unwrap()))
+                                            .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
                                             .await
                                             .unwrap_or_else(|e| eprintln!("Send error: {:?}", e));
                                     }
@@ -107,7 +107,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                         })
                                         .collect();
                                     write
-                                        .send(Message::Text(serde_json::to_string(&response).unwrap()))
+                                        .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
                                         .await
                                         .unwrap_or_else(|e| eprintln!("Send error: {:?}", e));
                                 }
@@ -128,7 +128,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             eprintln!("Broadcast error: {:?}", e);
                                         }
                                         write
-                                            .send(Message::Text(serde_json::to_string(&new_model).unwrap()))
+                                            .send(Message::Text(serde_json::to_string(&new_model).unwrap().into()))
                                             .await
                                             .unwrap_or_else(|e| eprintln!("Send error: {:?}", e));
                                     }
@@ -147,7 +147,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
     while let Ok(update) = rx.recv().await {
         println!("Forwarding update to client: {}", update);
         write
-            .send(Message::Text(update))
+            .send(Message::Text(update.into()))
             .await
             .unwrap_or_else(|e| eprintln!("Forward error: {:?}", e));
     }
@@ -160,7 +160,7 @@ where
 {
     let error_response = serde_json::to_string(&serde_json::json!({ "error": message })).unwrap();
     write
-        .send(Message::Text(error_response))
+        .send(Message::Text(error_response.into()))
         .await
         .unwrap_or_else(|e| eprintln!("Error: {:?}", e));
 }

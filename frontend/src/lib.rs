@@ -1,13 +1,13 @@
 use bevy::{
-    pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
+    pbr::{ CascadeShadowConfigBuilder, DirectionalLightShadowMap },
     prelude::*,
 };
-use bevy_panorbit_camera::{PanOrbitCameraPlugin, PanOrbitCamera};
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
-use serde::{Deserialize, Serialize};
+use bevy_panorbit_camera::{ PanOrbitCameraPlugin, PanOrbitCamera };
+use bevy_egui::{ egui, EguiContexts, EguiPlugin };
+use serde::{ Deserialize, Serialize };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::{ connect_async, tungstenite::Message };
+use futures_util::{ SinkExt, StreamExt };
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
@@ -35,7 +35,7 @@ struct ModelUpdateReceiver(mpsc::Receiver<Vec<ModelResponse>>);
 struct WebSocketCommandSender(mpsc::Sender<String>);
 
 #[derive(Resource)]
-struct RefreshTimer(Timer); // New timer resource for automatic refresh
+struct RefreshTimer(Timer);
 
 pub fn run() {
     App::new()
@@ -74,26 +74,22 @@ fn setup(mut commands: Commands) {
         .build(),
     ));
 
-    // Initialize ModelState with an empty list
     commands.insert_resource(ModelState {
         models: vec![],
         selected_model_id: None,
         current_entity: None,
     });
 
-    // Initialize RefreshTimer (30 Hz = 1/30 seconds)
     commands.insert_resource(RefreshTimer(Timer::new(
         std::time::Duration::from_secs_f32(1.0 / 30.0),
         TimerMode::Repeating,
     )));
 
-    // Set up channels
     let (update_tx, update_rx) = mpsc::channel(16);
     let (command_tx, mut command_rx) = mpsc::channel(16);
     commands.insert_resource(ModelUpdateReceiver(update_rx));
     commands.insert_resource(WebSocketCommandSender(command_tx));
 
-    // Spawn WebSocket thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -106,12 +102,11 @@ fn setup(mut commands: Commands) {
                 Ok((mut ws_stream, _)) => {
                     info!("WebSocket connected successfully");
 
-                    // Send initial "get_all" request
                     let request = ModelRequest {
                         action: "get_all".to_string(),
                         id: None,
                     };
-                    if let Err(e) = ws_stream.send(Message::Text(serde_json::to_string(&request).unwrap())).await {
+                    if let Err(e) = ws_stream.send(Message::Text(serde_json::to_string(&request).unwrap().into())).await {
                         error!("Failed to send initial get_all request: {}", e);
                         return;
                     }
@@ -148,7 +143,7 @@ fn setup(mut commands: Commands) {
                             }
                             Some(command) = command_rx.recv() => {
                                 info!("Received command from UI: {}", command);
-                                if let Err(e) = ws_stream.send(Message::Text(command)).await {
+                                if let Err(e) = ws_stream.send(Message::Text(command.into())).await {
                                     error!("Failed to send command to WebSocket: {}", e);
                                     break;
                                 }
@@ -196,7 +191,6 @@ fn ui_system(
                 });
         });
 
-        // Automatic refresh at 30 Hz
         refresh_timer.0.tick(time.delta());
         if refresh_timer.0.just_finished() {
             info!("Automatic refresh triggered (30 Hz), sending get_all request");
@@ -220,7 +214,6 @@ fn ui_system(
     });
 }
 
-// Helper function to send "get_all" request
 fn send_get_all_request(command_sender: &WebSocketCommandSender) {
     let request = ModelRequest {
         action: "get_all".to_string(),
