@@ -167,7 +167,7 @@ fn fetch_all_models() -> Result<Vec<ModelResponse>, String> {
         .map_err(|e| format!("Failed to create runtime: {}", e))?;
 
     rt.block_on(async {
-        let (mut ws_stream, _) = connect_async("ws://17.76.57.76:8000/ws")
+        let (mut ws_stream, _) = connect_async("ws://127.0.0.1:8000/ws")
             .await
             .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
 
