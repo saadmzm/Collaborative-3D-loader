@@ -57,7 +57,7 @@ async fn main() {
                         let update = serde_json::to_string(&updated_list).unwrap();
                         if let Err(e) = tx_clone.send(update) {
                             eprintln!("Broadcast error: {}", e);
-                        }
+                        }//smzm
                         last_models = current_models;
                     }
                 }
@@ -67,7 +67,7 @@ async fn main() {
         }
     });
 
-    while let Ok((stream, addr)) = listener.accept().await {
+    while let Ok((stream, _addr)) = listener.accept().await {
         let tx = tx.clone();
         tokio::spawn(handle_connection(stream, tx));
     }
@@ -96,14 +96,14 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                     match serde_json::from_str::<ModelRequest>(&text) {
                         Ok(request) => {
                             match request.action.as_str() {
-                                "get_by_id" => {
+                                "get_by_id" => {//saad
                                     if let Some(id) = request.id {
                                         match load_model_by_id(id) {
                                             Ok(model) => {
                                                 let response = ModelResponse {
                                                     id: model.id,
                                                     name: model.name,
-                                                    model_data: general_purpose::STANDARD.encode(&model.model_data),
+                                                    model_data: general_purpose::STANDARD.encode(&model.model_data),                                                                                                                                    //Made by Saad Moazzam
                                                 };
                                                 let response_str = serde_json::to_string(&response).unwrap();
                                                 if let Err(e) = write
@@ -119,7 +119,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             }
                                         }
                                     }
-                                }
+                                }//mzm
                                 "get_all" => {
                                     match load_all_models() {
                                         Ok(models) => {
@@ -246,7 +246,7 @@ fn load_model_by_id(model_id: i32) -> Result<ModelData> {
     let conn = init_db()?;
     let mut stmt = conn.prepare("SELECT id, Name, model_data FROM models WHERE id = ?1")?;
     let model_data = stmt.query_row(params![model_id], |row| {
-        Ok(ModelData {
+        Ok(ModelData {//made by saad moazzam
             id: row.get(0)?,
             name: row.get(1)?,
             model_data: row.get(2)?,
@@ -268,7 +268,7 @@ fn load_all_models() -> Result<Vec<ModelData>> {
     let mut models = Vec::new();
     for model in model_iter {
         models.push(model?);
-    }
+    }//mzm
     Ok(models)
 }
 
