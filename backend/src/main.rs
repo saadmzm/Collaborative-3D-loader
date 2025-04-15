@@ -6,25 +6,26 @@ use tokio::{
     net::{ TcpListener, TcpStream },
     sync::broadcast::{ self, Sender }
 };
-use tokio_tungstenite::{ accept_async, tungstenite::Message };
+use tokio_tungstenite::{ accept_async_with_config, tungstenite::Message };
+use base64::{ Engine as _, engine::general_purpose };
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
     action: String,
     id: Option<i32>,
-    path: Option<String>,
+    model_data: Option<String>, // base64-encoded model data for insert
 }
 
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Hash)]
 struct ModelResponse {
     id: i32,
-    path: String,
+    model_data: String, // base64-encoded model data
 }
 
 #[derive(Debug)]
 struct ModelData {
     id: i32,
-    path: String,
+    model_data: Vec<u8>, // raw binary data
 }
 
 #[tokio::main]
@@ -42,40 +43,44 @@ async fn main() {
                 Ok(models) => {
                     let current_models: HashSet<ModelResponse> = models
                         .into_iter()
-                        .map(|m| ModelResponse { id: m.id, path: m.path })
+                        .map(|m| ModelResponse {
+                            id: m.id,
+                            model_data: general_purpose::STANDARD.encode(&m.model_data),
+                        })
                         .collect();
                     if current_models != last_models {
-                        println!("Detected database change, broadcasting updated models");
                         let updated_list: Vec<ModelResponse> = current_models.iter().cloned().collect();
                         let update = serde_json::to_string(&updated_list).unwrap();
                         if let Err(e) = tx_clone.send(update) {
-                            eprintln!("Broadcast error: {:?}", e);
+                            eprintln!(""); // i made this change to remove broadcast error
                         }
                         last_models = current_models;
                     }
                 }
                 Err(e) => eprintln!("Failed to poll models: {}", e),
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
 
     while let Ok((stream, addr)) = listener.accept().await {
         let tx = tx.clone();
-        println!("New connection from: {}", addr);
         tokio::spawn(handle_connection(stream, tx));
     }
 }
 
 async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
-    let ws_stream = match accept_async(stream).await {
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(100 * 1024 * 1024); // 100 MB
+    config.max_frame_size = Some(100 * 1024 * 1024);   // 100 MB
+    config.accept_unmasked_frames = false;
+    let ws_stream = match accept_async_with_config(stream, Some(config)).await {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("Failed to accept WebSocket connection: {:?}", e);
             return;
         }
     };
-    println!("WebSocket connection established");
 
     let (mut write, mut read) = ws_stream.split();
     let mut rx = tx.subscribe();
@@ -84,7 +89,6 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
         tokio::select! {
             Some(Ok(message)) = read.next() => {
                 if let Message::Text(text) = message {
-                    println!("Received request: {}", text);
                     match serde_json::from_str::<ModelRequest>(&text) {
                         Ok(request) => {
                             match request.action.as_str() {
@@ -94,10 +98,11 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             Ok(model) => {
                                                 let response = ModelResponse {
                                                     id: model.id,
-                                                    path: model.path,
+                                                    model_data: general_purpose::STANDARD.encode(&model.model_data),
                                                 };
+                                                let response_str = serde_json::to_string(&response).unwrap();
                                                 if let Err(e) = write
-                                                    .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
+                                                    .send(Message::Text(response_str.into()))
                                                     .await
                                                 {
                                                     eprintln!("Send error: {:?}", e);
@@ -117,11 +122,12 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                                 .into_iter()
                                                 .map(|m| ModelResponse {
                                                     id: m.id,
-                                                    path: m.path,
+                                                    model_data: general_purpose::STANDARD.encode(&m.model_data),
                                                 })
                                                 .collect();
+                                            let response_str = serde_json::to_string(&response).unwrap();
                                             if let Err(e) = write
-                                                .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
+                                                .send(Message::Text(response_str.into()))
                                                 .await
                                             {
                                                 eprintln!("Send error: {:?}", e);
@@ -134,28 +140,34 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                     }
                                 }
                                 "insert" => {
-                                    if let Some(path) = request.path {
-                                        match insert_model(&path) {
-                                            Ok(new_id) => {
-                                                let new_model = ModelResponse {
-                                                    id: new_id,
-                                                    path,
-                                                };
-                                                let update = serde_json::to_string(&new_model).unwrap();
-                                                println!("Broadcasting new model: {}", update);
-                                                if let Err(e) = tx.send(update) {
-                                                    eprintln!("Broadcast error: {:?}", e);
-                                                }
-                                                if let Err(e) = write
-                                                    .send(Message::Text(serde_json::to_string(&new_model).unwrap().into()))
-                                                    .await
-                                                {
-                                                    eprintln!("Send error: {:?}", e);
-                                                    break;
+                                    if let Some(base64_data) = request.model_data {
+                                        match general_purpose::STANDARD.decode(&base64_data) {
+                                            Ok(model_data) => {
+                                                match insert_model(&model_data) {
+                                                    Ok(new_id) => {
+                                                        let new_model = ModelResponse {
+                                                            id: new_id,
+                                                            model_data: base64_data,
+                                                        };
+                                                        let update = serde_json::to_string(&new_model).unwrap();
+                                                        if let Err(e) = tx.send(update) {
+                                                            eprintln!("Broadcast error: {:?}", e);
+                                                        }
+                                                        if let Err(e) = write
+                                                            .send(Message::Text(serde_json::to_string(&new_model).unwrap().into()))
+                                                            .await
+                                                        {
+                                                            eprintln!("Send error: {:?}", e);
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        send_error(&mut write, &format!("Failed to insert model: {}", e)).await;
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
-                                                send_error(&mut write, &format!("Failed to insert model: {}", e)).await;
+                                                send_error(&mut write, &format!("Invalid base64 data: {}", e)).await;
                                             }
                                         }
                                     }
@@ -166,30 +178,25 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                         Err(e) => eprintln!("Failed to parse request: {}", e),
                     }
                 } else if let Message::Ping(data) = message {
-                    println!("Received ping, sending pong");
                     if let Err(e) = write.send(Message::Pong(data)).await {
                         eprintln!("Send pong error: {:?}", e);
                         break;
                     }
-                } else if let Message::Close(_)= message {
-                    println!("Received close message, closing connection");
+                } else if let Message::Close(_) = message {
                     break;
                 }
             }
             Ok(update) = rx.recv() => {
-                println!("Forwarding update to client: {}", update);
                 if let Err(e) = write.send(Message::Text(update.into())).await {
                     eprintln!("Forward error: {:?}", e);
                     break;
                 }
             }
             else => {
-                println!("No more messages or error in read stream, closing connection");
                 break;
             }
         }
     }
-    println!("WebSocket connection closed");
 }
 
 async fn send_error<S>(write: &mut S, message: &str)
@@ -208,7 +215,7 @@ fn init_db() -> Result<Connection> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS models (
             id INTEGER PRIMARY KEY,
-            path TEXT NOT NULL
+            model_data BLOB NOT NULL
         )",
         params![],
     )?;
@@ -217,11 +224,11 @@ fn init_db() -> Result<Connection> {
 
 fn load_model_by_id(model_id: i32) -> Result<ModelData> {
     let conn = init_db()?;
-    let mut stmt = conn.prepare("SELECT id, path FROM models WHERE id = ?1")?;
+    let mut stmt = conn.prepare("SELECT id, model_data FROM models WHERE id = ?1")?;
     let model_data = stmt.query_row(params![model_id], |row| {
         Ok(ModelData {
             id: row.get(0)?,
-            path: row.get(1)?,
+            model_data: row.get(1)?,
         })
     })?;
     Ok(model_data)
@@ -229,11 +236,11 @@ fn load_model_by_id(model_id: i32) -> Result<ModelData> {
 
 fn load_all_models() -> Result<Vec<ModelData>> {
     let conn = init_db()?;
-    let mut stmt = conn.prepare("SELECT id, path FROM models")?;
+    let mut stmt = conn.prepare("SELECT id, model_data FROM models")?;
     let model_iter = stmt.query_map(params![], |row| {
         Ok(ModelData {
             id: row.get(0)?,
-            path: row.get(1)?,
+            model_data: row.get(1)?,
         })
     })?;
     let mut models = Vec::new();
@@ -243,8 +250,8 @@ fn load_all_models() -> Result<Vec<ModelData>> {
     Ok(models)
 }
 
-fn insert_model(path: &str) -> Result<i32> {
+fn insert_model(model_data: &[u8]) -> Result<i32> {
     let conn = init_db()?;
-    conn.execute("INSERT INTO models (path) VALUES (?1)", params![path])?;
+    conn.execute("INSERT INTO models (model_data) VALUES (?1)", params![model_data])?;
     Ok(conn.last_insert_rowid() as i32)
 }

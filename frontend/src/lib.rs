@@ -6,10 +6,13 @@ use bevy_panorbit_camera::{ PanOrbitCameraPlugin, PanOrbitCamera };
 use bevy_egui::{ egui, EguiContexts, EguiPlugin };
 use serde::{ Deserialize, Serialize };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{ connect_async, tungstenite::Message };
+use tokio_tungstenite::{ connect_async_with_config, tungstenite::Message };
 use futures_util::{ SinkExt, StreamExt };
 use std::time::Duration;
 use uuid::Uuid;
+use base64::{ Engine as _, engine::general_purpose };
+use std::fs::File;
+use std::io::Write;
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
@@ -20,12 +23,12 @@ struct ModelRequest {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ModelResponse {
     id: i32,
-    path: String,
+    model_data: String, // base64-encoded
 }
 
 #[derive(Resource)]
 struct ModelState {
-    models: Vec<ModelResponse>,
+    models: Vec<(i32, String)>, // (id, temp_file_path)
     model_entities: Vec<(i32, Entity)>,
 }
 
@@ -86,27 +89,26 @@ fn setup(mut commands: Commands) {
         rt.block_on(async {
             let connection_id = Uuid::new_v4().to_string();
             loop {
-                info!("Connection {}: Attempting to connect to WebSocket", connection_id);
-                match connect_async("ws://127.0.0.1:8000/ws").await {
+                let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+                config.max_message_size = Some(100 * 1024 * 1024); // 100 MB
+                config.max_frame_size = Some(100 * 1024 * 1024);   // 100 MB
+                config.accept_unmasked_frames = false;
+                match connect_async_with_config("ws://127.0.0.1:8000/ws", Some(config), false).await {
                     Ok((mut ws_stream, _)) => {
-                        info!("Connection {}: WebSocket connected successfully", connection_id);
-
-                        // Send initial get_all request
                         let request = ModelRequest {
                             action: "get_all".to_string(),
                             id: None,
                         };
+                        let request_str = serde_json::to_string(&request).unwrap();
                         if let Err(e) = ws_stream
-                            .send(Message::Text(serde_json::to_string(&request).unwrap().into()))
+                            .send(Message::Text(request_str.clone().into()))
                             .await
                         {
                             error!("Connection {}: Failed to send initial get_all request: {}", connection_id, e);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
                             continue;
                         }
-                        info!("Connection {}: Sent initial get_all request", connection_id);
 
-                        // Send ping every 10 seconds to keep connection alive
                         let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
 
                         loop {
@@ -114,10 +116,8 @@ fn setup(mut commands: Commands) {
                                 Some(message_result) = ws_stream.next() => {
                                     match message_result {
                                         Ok(Message::Text(text)) => {
-                                            info!("Connection {}: Received WebSocket message: {}", connection_id, text);
                                             match serde_json::from_str::<Vec<ModelResponse>>(&text) {
                                                 Ok(models) => {
-                                                    info!("Connection {}: Parsed model list: {:?}", connection_id, models);
                                                     if let Err(e) = update_tx.send(models).await {
                                                         error!("Connection {}: Failed to send models to channel: {}", connection_id, e);
                                                         break;
@@ -125,18 +125,16 @@ fn setup(mut commands: Commands) {
                                                 }
                                                 Err(e) => {
                                                     error!("Connection {}: Failed to parse WebSocket message: {}", connection_id, e);
-                                                    warn!("Connection {}: Message content was: {}", connection_id, text);
                                                 }
                                             }
                                         }
                                         Ok(Message::Ping(_)) => {
-                                            info!("Connection {}: Received ping, sending pong", connection_id);
                                             if let Err(e) = ws_stream.send(Message::Pong(vec![].into())).await {
                                                 error!("Connection {}: Failed to send pong: {}", connection_id, e);
                                                 break;
                                             }
                                         }
-                                        Ok(other) => info!("Connection {}: Received non-text message, ignoring: {:?}", connection_id, other),
+                                        Ok(_) => {}
                                         Err(e) => {
                                             error!("Connection {}: WebSocket error: {}", connection_id, e);
                                             break;
@@ -144,7 +142,6 @@ fn setup(mut commands: Commands) {
                                     }
                                 }
                                 _ = ping_interval.tick() => {
-                                    info!("Connection {}: Sending ping to keep connection alive", connection_id);
                                     if let Err(e) = ws_stream.send(Message::Ping(vec![].into())).await {
                                         error!("Connection {}: Failed to send ping: {}", connection_id, e);
                                         break;
@@ -152,7 +149,6 @@ fn setup(mut commands: Commands) {
                                 }
                             }
                         }
-                        info!("Connection {}: WebSocket connection closed, reconnecting in 5 seconds", connection_id);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => {
@@ -171,8 +167,8 @@ fn ui_system(
 ) {
     egui::Window::new("Model List").show(contexts.ctx_mut(), |ui| {
         ui.label("Loaded Models:");
-        for model in &state.models {
-            ui.label(format!("ID: {} - {}", model.id, model.path));
+        for (id, _path) in &state.models {
+            ui.label(format!("ID: {}", id));
         }
     });
 }
@@ -184,35 +180,60 @@ fn handle_model_updates(
     asset_server: Res<AssetServer>,
 ) {
     while let Ok(models) = receiver.0.try_recv() {
-        info!("Received update with models: {:?}", models);
+        info!("Updating scene with {} models", models.len());
 
         // Remove entities for models no longer in the list
         state.model_entities.retain(|(id, entity)| {
             if models.iter().any(|m| m.id == *id) {
                 true
             } else {
-                info!("Removing entity for model ID={}", id);
+                info!("Removing model ID={}", id);
                 commands.entity(*entity).despawn();
                 false
             }
         });
 
-        // Load new models into the scene
-        for model in &models {
+        // Create new temp files and load models
+        let mut new_models = vec![];
+        for model in models {
             if !state.model_entities.iter().any(|(id, _)| *id == model.id) {
-                info!("Loading new model into scene: ID={}, Path={}", model.id, model.path);
-                let entity = commands
-                    .spawn(SceneRoot(asset_server.load(
-                        GltfAssetLabel::Scene(0).from_asset(model.path.clone()),
-                    )))
-                    .id();
-                state.model_entities.push((model.id, entity));
+                info!("Loading new model: ID={}", model.id);
+                // Decode base64
+                match general_purpose::STANDARD.decode(&model.model_data) {
+                    Ok(model_data) => {
+                        // Create temp file
+                        let temp_dir = std::env::temp_dir();
+                        let temp_file_name = format!("model_{}.gltf", model.id);
+                        let temp_path = temp_dir.join(&temp_file_name);
+                        let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
+
+                        // Write to temp file
+                        let mut file = File::create(&temp_path).expect("Failed to create temp file");
+                        file.write_all(&model_data).expect("Failed to write temp file");
+
+                        // Load into Bevy
+                        let entity = commands
+                            .spawn(SceneRoot(asset_server.load(
+                                GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
+                            )))
+                            .id();
+                        state.model_entities.push((model.id, entity));
+                        new_models.push((model.id, temp_path_str));
+                    }
+                    Err(e) => {
+                        error!("Failed to decode base64 for model ID={}: {}", model.id, e);
+                    }
+                }
+            } else {
+                // Keep existing temp file path
+                if let Some((_, temp_path)) = state.models.iter().find(|(id, _)| *id == model.id) {
+                    new_models.push((model.id, temp_path.clone()));
+                }
             }
         }
 
-        // Update the models list
-        state.models = models;
-        info!("Updated ModelState with {} models", state.models.len());
+        // Update models list with temp file paths
+        state.models = new_models;
     }
 }
 
