@@ -2,4 +2,3 @@
 /web
 Cargo.lock
 .DS_Store
-models.db
