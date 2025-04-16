@@ -14,11 +14,11 @@ cargo run --release
 
 ### Frontend
 
-- Change directory to frontend
 - Start the Client
 
 ```bash
-cargo run --release
+cargo run --release --bin frontend
 ```
 
-- You can add models from the Dialog box in the client window
+- You can add 3D models from the Dialog box in the client window.
+- Currently only Embedded Gltf 3D models work, more formats will be added in future.
