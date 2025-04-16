@@ -5,18 +5,16 @@ use bevy::{
 use bevy_panorbit_camera::{ PanOrbitCameraPlugin, PanOrbitCamera };
 use bevy_egui::{ egui, EguiContexts, EguiPlugin };
 use serde::{ Deserialize, Serialize };
-use std::{
-    path::Path,
-    io::Write,
-    fs::File,
-    time::Duration
-};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{ connect_async_with_config, tungstenite::Message };
 use futures_util::{ SinkExt, StreamExt };
+use std::time::Duration;
 use uuid::Uuid;
 use base64::{ Engine as _, engine::general_purpose };
+use std::fs::File;
+use std::io::Write;
 use rfd::FileDialog;
+use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
@@ -49,6 +47,12 @@ struct UploadState {
     file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>), String>)>,
     file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>), String>)>,
     model_name: String,
+    selected_model: Option<i32>, // None for "All Models", Some(id) for single model
+}
+
+#[derive(Resource, Default)]
+struct LastSelectedModel {
+    id: Option<i32>,
 }
 
 pub fn run() {
@@ -64,9 +68,25 @@ pub fn run() {
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (ui_system, handle_model_updates, handle_file_results))
+        .add_systems(Update, (
+            ui_system,
+            handle_model_updates,
+            handle_file_results,
+            update_scene_on_selection,
+            block_camera_on_egui
+        ))
         .add_systems(Startup, debug_resources)
         .run();
+}
+
+fn block_camera_on_egui(
+    mut camera_query: Query<&mut PanOrbitCamera>,
+    mut egui_context: EguiContexts,
+) {
+    let is_egui_active = egui_context.ctx_mut().wants_pointer_input();
+    for mut camera in camera_query.iter_mut() {
+        camera.enabled = !is_egui_active;
+    }
 }
 
 fn setup(mut commands: Commands) {
@@ -103,7 +123,9 @@ fn setup(mut commands: Commands) {
         file_tx,
         file_rx,
         model_name: String::new(),
+        selected_model: None, // Explicitly None for All Models
     });
+    commands.insert_resource(LastSelectedModel::default());
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -115,8 +137,8 @@ fn setup(mut commands: Commands) {
             let connection_id = Uuid::new_v4().to_string();
             loop {
                 let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-                config.max_message_size = Some(100 * 1024 * 1024); // 100 MB
-                config.max_frame_size = Some(100 * 1024 * 1024);   // 100 MB
+                config.max_message_size = Some(100 * 1024 * 1024);
+                config.max_frame_size = Some(100 * 1024 * 1024);
                 config.accept_unmasked_frames = false;
                 match connect_async_with_config("ws://127.0.0.1:8000/ws", Some(config), false).await {
                     Ok((mut ws_stream, _)) => {
@@ -199,51 +221,99 @@ fn ui_system(
     state: Res<ModelState>,
     mut upload_state: ResMut<UploadState>,
 ) {
-    // Model List Window
+    // Model List Window (default position, left side)
     egui::Window::new("Model List").show(contexts.ctx_mut(), |ui| {
         ui.label("Loaded Models:");
         for (id, _path, name) in &state.models {
             let display_name = name
                 .as_ref()
                 .map_or_else(|| format!("Model {}", id), |n| n.clone());
-            ui.label(format!("{}. {}", id, display_name));
+            ui.horizontal(|ui| {
+                ui.label(format!("{}. {}", id, display_name));
+                if ui.button("Delete").clicked() {
+                    let request = ModelRequest {
+                        action: "delete".to_string(),
+                        id: Some(*id),
+                        name: None,
+                        model_data: None,
+                    };
+                    let request_str = serde_json::to_string(&request).unwrap();
+                    if let Err(e) = upload_state.ws_tx.try_send(request_str) {
+                        error!("Failed to send delete request for ID {}: {}", id, e);
+                    }
+                }
+            });
         }
     });
 
-    // Upload Model Window
-    egui::Window::new("Upload Model").show(contexts.ctx_mut(), |ui| {
-        ui.label("Model Name:");
-        ui.text_edit_singleline(&mut upload_state.model_name);
-        ui.label("Select a .gltf file to upload:");
-        if ui.button("Choose File").clicked() {
-            if upload_state.status != "Uploading..." {
-                upload_state.status = "Uploading...".to_string();
-                let file_tx = upload_state.file_tx.clone();
-                std::thread::spawn(move || {
-                    let (path_str, result) = if let Some(path) = FileDialog::new()
-                        .add_filter("GLTF Files", &["gltf"])
-                        .pick_file()
-                    {
-                        let path_str = path.to_string_lossy().to_string();
-                        let file_name = Path::new(&path_str)
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .map(|s| s.to_string());
-                        match std::fs::read(&path) {
-                            Ok(data) => (path_str, Ok((data, file_name))),
-                            Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+    // Upload Model Window (positioned on the right)
+    egui::Window::new("Upload Model")
+        .default_pos([1000.0, 50.0]) // Right side for 1280x720 window
+        .show(contexts.ctx_mut(), |ui| {
+            ui.label("Model Name:");
+            ui.text_edit_singleline(&mut upload_state.model_name);
+            ui.label("Select a .gltf file to upload:");
+            if ui.button("Choose File").clicked() {
+                if upload_state.status != "Uploading..." {
+                    upload_state.status = "Uploading...".to_string();
+                    let file_tx = upload_state.file_tx.clone();
+                    std::thread::spawn(move || {
+                        let (path_str, result) = if let Some(path) = FileDialog::new()
+                            .add_filter("GLTF Files", &["gltf"])
+                            .pick_file()
+                        {
+                            let path_str = path.to_string_lossy().to_string();
+                            let file_name = Path::new(&path_str)
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .map(|s| s.to_string());
+                            match std::fs::read(&path) {
+                                Ok(data) => (path_str, Ok((data, file_name))),
+                                Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+                            }
+                        } else {
+                            ("".to_string(), Err("No file selected".to_string()))
+                        };
+                        if let Err(e) = file_tx.blocking_send((path_str, result)) {
+                            error!("Failed to send file result: {}", e);
                         }
-                    } else {
-                        ("".to_string(), Err("No file selected".to_string()))
-                    };
-                    if let Err(e) = file_tx.blocking_send((path_str, result)) {
-                        error!("Failed to send file result: {}", e);
+                    });
+                }
+            }
+            ui.label(&upload_state.status);
+        });
+
+    // Model Selection Window (centered)
+    egui::Window::new("Model Selection")
+        .default_pos([640.0, 360.0]) // Center for 1280x720 window
+        .show(contexts.ctx_mut(), |ui| {
+            let selected_text = match upload_state.selected_model {
+                None => "All Models".to_string(),
+                Some(id) => state
+                    .models
+                    .iter()
+                    .find(|(model_id, _, _)| *model_id == id)
+                    .map(|(_, _, name)| {
+                        name.as_ref()
+                            .map_or_else(|| format!("Model {}", id), |n| format!("{}: {}", id, n))
+                    })
+                    .unwrap_or_else(|| "Model Not Found".to_string()),
+            };
+
+            egui::ComboBox::from_label("Select Model")
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    // Option for All Models
+                    ui.selectable_value(&mut upload_state.selected_model, None, "All Models");
+                    // Options for individual models
+                    for (id, _, name) in &state.models {
+                        let display_name = name
+                            .as_ref()
+                            .map_or_else(|| format!("Model {}", id), |n| format!("{}: {}", id, n));
+                        ui.selectable_value(&mut upload_state.selected_model, Some(*id), display_name);
                     }
                 });
-            }
-        }
-        ui.label(&upload_state.status);
-    });
+        });
 }
 
 fn handle_file_results(
@@ -288,73 +358,112 @@ fn handle_file_results(
     }
 }
 
+fn update_scene_on_selection(
+    mut commands: Commands,
+    mut state: ResMut<ModelState>,
+    upload_state: Res<UploadState>,
+    mut last_selected: ResMut<LastSelectedModel>,
+    asset_server: Res<AssetServer>,
+) {
+    // Always check if scene needs update
+    let should_update = last_selected.id != upload_state.selected_model ||
+        state.model_entities.iter().map(|(id, _)| *id).collect::<Vec<_>>() !=
+        match upload_state.selected_model {
+            Some(id) => state.models.iter().filter(|(mid, _, _)| *mid == id).map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            None => state.models.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+        };
+
+    if should_update {
+        info!("Updating scene, selected: {:?}", upload_state.selected_model);
+
+        // Despawn all existing entities
+        for (_, entity) in state.model_entities.drain(..) {
+            info!("Despawning entity for model");
+            commands.entity(entity).despawn();
+        }
+        state.model_entities.clear();
+
+        // Load models based on selection
+        let filtered_models = match upload_state.selected_model {
+            Some(selected_id) => state
+                .models
+                .iter()
+                .filter(|(id, _, _)| *id == selected_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            None => state.models.clone(),
+        };
+
+        // Spawn filtered models
+        for (id, temp_path_str, _name) in filtered_models {
+            info!("Loading model ID={} at path {}", id, temp_path_str);
+            let entity = commands
+                .spawn(SceneRoot(asset_server.load(
+                    GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
+                )))
+                .id();
+            state.model_entities.push((id, entity));
+        }
+
+        // Update last selected
+        last_selected.id = upload_state.selected_model;
+    }
+}
+
 fn handle_model_updates(
     mut state: ResMut<ModelState>,
-    mut commands: Commands,
     mut receiver: ResMut<ModelUpdateReceiver>,
-    asset_server: Res<AssetServer>,
     mut upload_state: ResMut<UploadState>,
+    mut last_selected: ResMut<LastSelectedModel>,
 ) {
     while let Ok(models) = receiver.0.try_recv() {
-        info!("Updating scene with {} models", models.len());
+        info!("Received {} models, selected: {:?}", models.len(), upload_state.selected_model);
 
         // Update upload status if new models detected
         if !models.is_empty() && upload_state.status == "Upload queued" {
             upload_state.status = "Upload successful".to_string();
         }
 
-        // Remove entities for models no longer in the list
-        state.model_entities.retain(|(id, entity)| {
-            if models.iter().any(|m| m.id == *id) {
-                true
-            } else {
-                info!("Removing model ID={}", id);
-                commands.entity(*entity).despawn();
-                false
-            }
-        });
-
-        // Create new temp files and load models
+        // Update state.models with all models to keep dropdown accurate
         let mut new_models = vec![];
         for model in models {
-            if !state.model_entities.iter().any(|(id, _)| *id == model.id) {
-                info!("Loading new model: ID={}", model.id);
-                // Decode base64
-                match general_purpose::STANDARD.decode(&model.model_data) {
-                    Ok(model_data) => {
-                        // Create temp file
-                        let temp_dir = std::env::temp_dir();
-                        let temp_file_name = format!("model_{}.gltf", model.id);
-                        let temp_path = temp_dir.join(&temp_file_name);
-                        let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
+            let temp_path = state
+                .models
+                .iter()
+                .find(|(id, _, _)| *id == model.id)
+                .map(|(_, path, _)| path.clone())
+                .unwrap_or_else(|| {
+                    let temp_dir = std::env::temp_dir();
+                    let temp_file_name = format!("model_{}.gltf", model.id);
+                    let temp_path = temp_dir.join(&temp_file_name);
+                    let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
 
-                        // Write to temp file
-                        let mut file = File::create(&temp_path).expect("Failed to create temp file");
-                        file.write_all(&model_data).expect("Failed to write temp file");
+                    // Write to temp file
+                    match general_purpose::STANDARD.decode(&model.model_data) {
+                        Ok(model_data) => {
+                            let mut file = File::create(&temp_path).expect("Failed to create temp file");
+                            file.write_all(&model_data).expect("Failed to write temp file");
+                        }
+                        Err(e) => {
+                            error!("Failed to decode base64 for model ID={}: {}", model.id, e);
+                        }
+                    }
+                    temp_path_str
+                });
+            new_models.push((model.id, temp_path, model.name));
+        }
+        state.models = new_models;
 
-                        // Load into Bevy
-                        let entity = commands
-                            .spawn(SceneRoot(asset_server.load(
-                                GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
-                            )))
-                            .id();
-                        state.model_entities.push((model.id, entity));
-                        new_models.push((model.id, temp_path_str, model.name));
-                    }
-                    Err(e) => {
-                        error!("Failed to decode base64 for model ID={}: {}", model.id, e);
-                    }
-                }
-            } else {
-                // Keep existing temp file path and update name
-                if let Some((_, temp_path, _)) = state.models.iter().find(|(id, _, _)| *id == model.id) {
-                    new_models.push((model.id, temp_path.clone(), model.name));
-                }
+        // Trigger scene update
+        last_selected.id = None;
+
+        // Reset selection if model not found
+        if let Some(selected_id) = upload_state.selected_model {
+            if !state.models.iter().any(|(id, _, _)| *id == selected_id) {
+                info!("Selected model ID={} not found, resetting to All Models", selected_id);
+                upload_state.selected_model = None;
             }
         }
-
-        // Update models list with temp file paths and names
-        state.models = new_models;
     }
 }
 

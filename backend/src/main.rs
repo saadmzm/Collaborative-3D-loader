@@ -13,22 +13,22 @@ use base64::{ Engine as _, engine::general_purpose };
 struct ModelRequest {
     action: String,
     id: Option<i32>,
-    name: Option<String>,       // New field for model name
+    name: Option<String>,
     model_data: Option<String>, // base64-encoded model data for insert
 }
 
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Hash)]
 struct ModelResponse {
     id: i32,
-    name: Option<String>,      // New field for model name
-    model_data: String,        // base64-encoded model data
+    name: Option<String>,
+    model_data: String, // base64-encoded model data
 }
 
 #[derive(Debug)]
 struct ModelData {
     id: i32,
-    name: Option<String>, // New field for model name
-    model_data: Vec<u8>,  // raw binary data
+    name: Option<String>,
+    model_data: Vec<u8>, // raw binary data
 }
 
 #[tokio::main]
@@ -57,7 +57,7 @@ async fn main() {
                         let update = serde_json::to_string(&updated_list).unwrap();
                         if let Err(e) = tx_clone.send(update) {
                             eprintln!("Broadcast error: {}", e);
-                        }//smzm
+                        }
                         last_models = current_models;
                     }
                 }
@@ -96,14 +96,14 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                     match serde_json::from_str::<ModelRequest>(&text) {
                         Ok(request) => {
                             match request.action.as_str() {
-                                "get_by_id" => {//saad
+                                "get_by_id" => {
                                     if let Some(id) = request.id {
                                         match load_model_by_id(id) {
                                             Ok(model) => {
                                                 let response = ModelResponse {
                                                     id: model.id,
                                                     name: model.name,
-                                                    model_data: general_purpose::STANDARD.encode(&model.model_data),                                                                                                                                    //Made by Saad Moazzam
+                                                    model_data: general_purpose::STANDARD.encode(&model.model_data),
                                                 };
                                                 let response_str = serde_json::to_string(&response).unwrap();
                                                 if let Err(e) = write
@@ -119,7 +119,7 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             }
                                         }
                                     }
-                                }//mzm
+                                }
                                 "get_all" => {
                                     match load_all_models() {
                                         Ok(models) => {
@@ -175,6 +175,44 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                             }
                                             Err(e) => {
                                                 send_error(&mut write, &format!("Invalid base64 data: {}", e)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "delete" => {
+                                    if let Some(id) = request.id {
+                                        match delete_model(id) {
+                                            Ok(()) => {
+                                                // Broadcast updated model list
+                                                match load_all_models() {
+                                                    Ok(models) => {
+                                                        let response: Vec<ModelResponse> = models
+                                                            .into_iter()
+                                                            .map(|m| ModelResponse {
+                                                                id: m.id,
+                                                                name: m.name,
+                                                                model_data: general_purpose::STANDARD.encode(&m.model_data),
+                                                            })
+                                                            .collect();
+                                                        let update = serde_json::to_string(&response).unwrap();
+                                                        if let Err(e) = tx.send(update) {
+                                                            eprintln!("Broadcast error: {:?}", e);
+                                                        }
+                                                        if let Err(e) = write
+                                                            .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
+                                                            .await
+                                                        {
+                                                            eprintln!("Send error: {:?}", e);
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        send_error(&mut write, &format!("Failed to load models after delete: {}", e)).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                send_error(&mut write, &format!("Failed to delete model: {}", e)).await;
                                             }
                                         }
                                     }
@@ -246,7 +284,7 @@ fn load_model_by_id(model_id: i32) -> Result<ModelData> {
     let conn = init_db()?;
     let mut stmt = conn.prepare("SELECT id, Name, model_data FROM models WHERE id = ?1")?;
     let model_data = stmt.query_row(params![model_id], |row| {
-        Ok(ModelData {//made by saad moazzam
+        Ok(ModelData {
             id: row.get(0)?,
             name: row.get(1)?,
             model_data: row.get(2)?,
@@ -268,7 +306,7 @@ fn load_all_models() -> Result<Vec<ModelData>> {
     let mut models = Vec::new();
     for model in model_iter {
         models.push(model?);
-    }//mzm
+    }
     Ok(models)
 }
 
@@ -276,4 +314,13 @@ fn insert_model(model_data: &[u8], name: Option<&str>) -> Result<i32> {
     let conn = init_db()?;
     conn.execute("INSERT INTO models (Name, model_data) VALUES (?1, ?2)", params![name, model_data])?;
     Ok(conn.last_insert_rowid() as i32)
+}
+
+fn delete_model(model_id: i32) -> Result<()> {
+    let conn = init_db()?;
+    let rows_affected = conn.execute("DELETE FROM models WHERE id = ?1", params![model_id])?;
+    if rows_affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
 }
