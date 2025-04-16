@@ -5,16 +5,18 @@ use bevy::{
 use bevy_panorbit_camera::{ PanOrbitCameraPlugin, PanOrbitCamera };
 use bevy_egui::{ egui, EguiContexts, EguiPlugin };
 use serde::{ Deserialize, Serialize };
+use std::{
+    time::Duration,
+    fs::File,
+    io::Write,
+    path::Path,
+};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{ connect_async_with_config, tungstenite::Message };
 use futures_util::{ SinkExt, StreamExt };
-use std::time::Duration;
 use uuid::Uuid;
 use base64::{ Engine as _, engine::general_purpose };
-use std::fs::File;
-use std::io::Write;
 use rfd::FileDialog;
-use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
