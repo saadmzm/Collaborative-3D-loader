@@ -6,14 +6,31 @@ authors = ["Saad Moazzam"]
 rust-version = "1.86.0"
 
 [dependencies]
-bevy = "0.15.3"
+bevy = { version = "0.15.3", features = ["dynamic_linking"] }
 bevy_egui = "0.33.0"
 bevy_panorbit_camera = "0.25.0"
-futures-util = "0.3.31"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-tokio = { version = "1.44.2", features = ["rt", "net", "sync", "macros", "time"] }
-tokio-tungstenite = "0.26.2"
 uuid = { version = "1.12.1", features = ["v4"] }
 base64 = "0.22.1"
-rfd = "0.15.0"
+wasm-bindgen = "0.2.95"
+wasm-bindgen-futures = "0.4.45"
+web-sys = { version = "0.3.72", features = [
+    "console",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlInputElement",
+    "FileReader",
+    "WebSocket",
+    "Event",
+    "EventTarget",
+    "Blob",
+    "BinaryType",
+    "MessageEvent",
+    "FileList",
+    "File"
+] }
+js-sys = "0.3.72"
+console_error_panic_hook = "0.1.7"
+lazy_static = "1.4.0"
