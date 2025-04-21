@@ -16,4 +16,4 @@ tokio = { version = "1.44.2", features = ["rt", "net", "sync", "macros", "time"]
 tokio-tungstenite = "0.26.2"
 uuid = { version = "1.12.1", features = ["v4"] }
 base64 = "0.22.1"
-rfd = "0.15.0"
+rfd = "0.15.3"
