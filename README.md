@@ -1,4 +1,4 @@
-# Collaborative 3D Models Loader
+# Collaborative 3D Model Loader
 
 ## Setup
 
