@@ -8,7 +8,7 @@
 
 ## Usage
 
-- Run the Backend and Frontend in different terminals.
+- Run the Backend and Frontends in different terminals.
 
 ### Backend
 
