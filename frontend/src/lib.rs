@@ -24,6 +24,7 @@ struct ModelRequest {
     id: Option<i32>,
     name: Option<String>,
     model_data: Option<String>, // base64-encoded
+    file_type: Option<String>,  // "gltf" or "houdini_json"
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -31,11 +32,12 @@ struct ModelResponse {
     id: i32,
     name: Option<String>,
     model_data: String, // base64-encoded
+    file_type: String,  // "gltf" or "houdini_json"
 }
 
 #[derive(Resource)]
 struct ModelState {
-    models: Vec<(i32, String, Option<String>)>, // (id, temp_file_path, name)
+    models: Vec<(i32, String, Option<String>, String)>, // (id, temp_file_path, name, file_type)
     model_entities: Vec<(i32, Entity)>,
 }
 
@@ -46,15 +48,17 @@ struct ModelUpdateReceiver(mpsc::Receiver<Vec<ModelResponse>>);
 struct UploadState {
     status: String,
     ws_tx: mpsc::Sender<String>,
-    file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>), String>)>,
-    file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>), String>)>,
+    file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
+    file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
     model_name: String,
     selected_model: Option<i32>, // None for "All Models", Some(id) for single model
+    file_filter: String,        // Current file filter: "All", "gltf", "houdini_json"
 }
 
 #[derive(Resource, Default)]
 struct LastSelectedModel {
     id: Option<i32>,
+    filter: String,
 }
 
 pub fn run() {
@@ -62,7 +66,7 @@ pub fn run() {
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "PGS Renderman".to_string(),
+                title: "PGS Renderman - GLTF & Houdini JSON Viewer".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -125,9 +129,13 @@ fn setup(mut commands: Commands) {
         file_tx,
         file_rx,
         model_name: String::new(),
-        selected_model: None, // Explicitly None for All Models
+        selected_model: None,
+        file_filter: "All".to_string(),
     });
-    commands.insert_resource(LastSelectedModel::default());
+    commands.insert_resource(LastSelectedModel {
+        id: None,
+        filter: "All".to_string(),
+    });
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -149,6 +157,7 @@ fn setup(mut commands: Commands) {
                             id: None,
                             name: None,
                             model_data: None,
+                            file_type: None,
                         };
                         let request_str = serde_json::to_string(&request).unwrap();
                         if let Err(e) = ws_stream
@@ -225,19 +234,43 @@ fn ui_system(
 ) {
     // Model List Window (default position, left side)
     egui::Window::new("Model List").show(contexts.ctx_mut(), |ui| {
+        ui.label("File Type Filter:");
+        egui::ComboBox::from_label("Filter")
+            .selected_text(&upload_state.file_filter)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut upload_state.file_filter, "All".to_string(), "All Files");
+                ui.selectable_value(&mut upload_state.file_filter, "gltf".to_string(), "GLTF Files");
+                ui.selectable_value(&mut upload_state.file_filter, "houdini_json".to_string(), "Houdini JSON Files");
+            });
+        
+        ui.separator();
         ui.label("Loaded Models:");
-        for (id, _path, name) in &state.models {
+        
+        let filtered_models: Vec<_> = state.models.iter()
+            .filter(|(_, _, _, file_type)| {
+                upload_state.file_filter == "All" || upload_state.file_filter == *file_type
+            })
+            .collect();
+        
+        for (id, _path, name, file_type) in &filtered_models {
             let display_name = name
                 .as_ref()
                 .map_or_else(|| format!("Model {}", id), |n| n.clone());
+            let file_type_display = match file_type.as_str() {
+                "gltf" => "GLTF",
+                "houdini_json" => "Houdini",
+                _ => "Unknown"
+            };
+            
             ui.horizontal(|ui| {
-                ui.label(format!("{}. {}", id, display_name));
+                ui.label(format!("[{}] {}. {}", file_type_display, id, display_name));
                 if ui.button("Delete").clicked() {
                     let request = ModelRequest {
                         action: "delete".to_string(),
                         id: Some(*id),
                         name: None,
                         model_data: None,
+                        file_type: None,
                     };
                     let request_str = serde_json::to_string(&request).unwrap();
                     if let Err(e) = upload_state.ws_tx.try_send(request_str) {
@@ -254,50 +287,100 @@ fn ui_system(
         .show(contexts.ctx_mut(), |ui| {
             ui.label("Model Name:");
             ui.text_edit_singleline(&mut upload_state.model_name);
-            ui.label("Select a .gltf file to upload:");
-            if ui.button("Choose File").clicked() {
-                if upload_state.status != "Uploading..." {
-                    upload_state.status = "Uploading...".to_string();
-                    let file_tx = upload_state.file_tx.clone();
-                    std::thread::spawn(move || {
-                        let (path_str, result) = if let Some(path) = FileDialog::new()
-                            .add_filter("GLTF Files", &["gltf"])
-                            .pick_file()
-                        {
-                            let path_str = path.to_string_lossy().to_string();
-                            let file_name = Path::new(&path_str)
-                                .file_stem()
-                                .and_then(|stem| stem.to_str())
-                                .map(|s| s.to_string());
-                            match std::fs::read(&path) {
-                                Ok(data) => (path_str, Ok((data, file_name))),
-                                Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+            
+            ui.separator();
+            ui.label("Select a file to upload:");
+            
+            ui.horizontal(|ui| {
+                if ui.button("Choose GLTF File").clicked() {
+                    if upload_state.status != "Uploading..." {
+                        upload_state.status = "Uploading...".to_string();
+                        let file_tx = upload_state.file_tx.clone();
+                        std::thread::spawn(move || {
+                            let (path_str, result) = if let Some(path) = FileDialog::new()
+                                .add_filter("GLTF Files", &["gltf"])
+                                .pick_file()
+                            {
+                                let path_str = path.to_string_lossy().to_string();
+                                let file_name = Path::new(&path_str)
+                                    .file_stem()
+                                    .and_then(|stem| stem.to_str())
+                                    .map(|s| s.to_string());
+                                match std::fs::read(&path) {
+                                    Ok(data) => (path_str, Ok((data, file_name, "gltf".to_string()))),
+                                    Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+                                }
+                            } else {
+                                ("".to_string(), Err("No file selected".to_string()))
+                            };
+                            if let Err(e) = file_tx.blocking_send((path_str, result)) {
+                                error!("Failed to send file result: {}", e);
                             }
-                        } else {
-                            ("".to_string(), Err("No file selected".to_string()))
-                        };
-                        if let Err(e) = file_tx.blocking_send((path_str, result)) {
-                            error!("Failed to send file result: {}", e);
-                        }
-                    });
+                        });
+                    }
                 }
-            }
+                
+                if ui.button("Choose Houdini JSON").clicked() {
+                    if upload_state.status != "Uploading..." {
+                        upload_state.status = "Uploading...".to_string();
+                        let file_tx = upload_state.file_tx.clone();
+                        std::thread::spawn(move || {
+                            let (path_str, result) = if let Some(path) = FileDialog::new()
+                                .add_filter("JSON Files", &["json"])
+                                .pick_file()
+                            {
+                                let path_str = path.to_string_lossy().to_string();
+                                let file_name = Path::new(&path_str)
+                                    .file_stem()
+                                    .and_then(|stem| stem.to_str())
+                                    .map(|s| s.to_string());
+                                match std::fs::read(&path) {
+                                    Ok(data) => (path_str, Ok((data, file_name, "houdini_json".to_string()))),
+                                    Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+                                }
+                            } else {
+                                ("".to_string(), Err("No file selected".to_string()))
+                            };
+                            if let Err(e) = file_tx.blocking_send((path_str, result)) {
+                                error!("Failed to send file result: {}", e);
+                            }
+                        });
+                    }
+                }
+            });
+            
+            ui.separator();
             ui.label(&upload_state.status);
+            
+            ui.separator();
+            ui.label("Supported Formats:");
+            ui.label("• GLTF (.gltf) - Standard 3D format");
+            ui.label("• Houdini JSON (.json) - Geometry from Houdini");
         });
 
     // Model Selection Window (centered)
     egui::Window::new("Model Selection")
         .default_pos([640.0, 360.0]) // Center for 1280x720 window
         .show(contexts.ctx_mut(), |ui| {
+            let filtered_models: Vec<_> = state.models.iter()
+                .filter(|(_, _, _, file_type)| {
+                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
+                })
+                .collect();
+            
             let selected_text = match upload_state.selected_model {
                 None => "All Models".to_string(),
-                Some(id) => state
-                    .models
+                Some(id) => filtered_models
                     .iter()
-                    .find(|(model_id, _, _)| *model_id == id)
-                    .map(|(_, _, name)| {
+                    .find(|(model_id, _, _, _)| *model_id == id)
+                    .map(|(_, _, name, file_type)| {
+                        let file_prefix = match file_type.as_str() {
+                            "gltf" => "[GLTF]",
+                            "houdini_json" => "[Houdini]",
+                            _ => "[Unknown]"
+                        };
                         name.as_ref()
-                            .map_or_else(|| format!("Model {}", id), |n| format!("{}: {}", id, n))
+                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
                     })
                     .unwrap_or_else(|| "Model Not Found".to_string()),
             };
@@ -307,11 +390,16 @@ fn ui_system(
                 .show_ui(ui, |ui| {
                     // Option for All Models
                     ui.selectable_value(&mut upload_state.selected_model, None, "All Models");
-                    // Options for individual models
-                    for (id, _, name) in &state.models {
+                    // Options for individual models (filtered)
+                    for (id, _, name, file_type) in &filtered_models {
+                        let file_prefix = match file_type.as_str() {
+                            "gltf" => "[GLTF]",
+                            "houdini_json" => "[Houdini]",
+                            _ => "[Unknown]"
+                        };
                         let display_name = name
                             .as_ref()
-                            .map_or_else(|| format!("Model {}", id), |n| format!("{}: {}", id, n));
+                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
                         ui.selectable_value(&mut upload_state.selected_model, Some(*id), display_name);
                     }
                 });
@@ -323,7 +411,7 @@ fn handle_file_results(
 ) {
     while let Ok((path, result)) = upload_state.file_rx.try_recv() {
         match result {
-            Ok((data, file_name)) => {
+            Ok((data, file_name, file_type)) => {
                 // Set model_name to file_name if not user-edited
                 if upload_state.model_name.is_empty() {
                     if let Some(name) = &file_name {
@@ -340,6 +428,7 @@ fn handle_file_results(
                         Some(upload_state.model_name.clone())
                     },
                     model_data: Some(base64_data),
+                    file_type: Some(file_type),
                 };
                 let request_str = serde_json::to_string(&request).unwrap();
                 if let Err(e) = upload_state.ws_tx.try_send(request_str) {
@@ -367,16 +456,28 @@ fn update_scene_on_selection(
     mut last_selected: ResMut<LastSelectedModel>,
     asset_server: Res<AssetServer>,
 ) {
-    // Always check if scene needs update
+    // Filter models based on current filter
+    let filtered_models: Vec<_> = state.models.iter()
+        .filter(|(_, _, _, file_type)| {
+            upload_state.file_filter == "All" || upload_state.file_filter == *file_type
+        })
+        .cloned()
+        .collect();
+    
+    // Check if scene needs update (selection or filter changed)
     let should_update = last_selected.id != upload_state.selected_model ||
+        last_selected.filter != upload_state.file_filter ||
         state.model_entities.iter().map(|(id, _)| *id).collect::<Vec<_>>() !=
         match upload_state.selected_model {
-            Some(id) => state.models.iter().filter(|(mid, _, _)| *mid == id).map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            None => state.models.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            Some(id) => filtered_models.iter()
+                .filter(|(mid, _, _, _)| *mid == id)
+                .map(|(id, _, _, _)| *id)
+                .collect::<Vec<_>>(),
+            None => filtered_models.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
         };
 
     if should_update {
-        info!("Updating scene, selected: {:?}", upload_state.selected_model);
+        info!("Updating scene, selected: {:?}, filter: {}", upload_state.selected_model, upload_state.file_filter);
 
         // Despawn all existing entities
         for (_, entity) in state.model_entities.drain(..) {
@@ -385,20 +486,19 @@ fn update_scene_on_selection(
         }
         state.model_entities.clear();
 
-        // Load models based on selection
-        let filtered_models = match upload_state.selected_model {
-            Some(selected_id) => state
-                .models
+        // Load models based on selection and filter
+        let models_to_load = match upload_state.selected_model {
+            Some(selected_id) => filtered_models
                 .iter()
-                .filter(|(id, _, _)| *id == selected_id)
+                .filter(|(id, _, _, _)| *id == selected_id)
                 .cloned()
                 .collect::<Vec<_>>(),
-            None => state.models.clone(),
+            None => filtered_models,
         };
 
         // Spawn filtered models
-        for (id, temp_path_str, _name) in filtered_models {
-            info!("Loading model ID={} at path {}", id, temp_path_str);
+        for (id, temp_path_str, _name, file_type) in models_to_load {
+            info!("Loading model ID={} ({}) at path {}", id, file_type, temp_path_str);
             let entity = commands
                 .spawn(SceneRoot(asset_server.load(
                     GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
@@ -407,8 +507,9 @@ fn update_scene_on_selection(
             state.model_entities.push((id, entity));
         }
 
-        // Update last selected
+        // Update last selected state
         last_selected.id = upload_state.selected_model;
+        last_selected.filter = upload_state.file_filter.clone();
     }
 }
 
@@ -432,8 +533,8 @@ fn handle_model_updates(
             let temp_path = state
                 .models
                 .iter()
-                .find(|(id, _, _)| *id == model.id)
-                .map(|(_, path, _)| path.clone())
+                .find(|(id, _, _, _)| *id == model.id)
+                .map(|(_, path, _, _)| path.clone())
                 .unwrap_or_else(|| {
                     let temp_dir = std::env::temp_dir();
                     let temp_file_name = format!("model_{}.gltf", model.id);
@@ -452,17 +553,23 @@ fn handle_model_updates(
                     }
                     temp_path_str
                 });
-            new_models.push((model.id, temp_path, model.name));
+            new_models.push((model.id, temp_path, model.name, model.file_type));
         }
         state.models = new_models;
 
-        // Trigger scene update
+        // Trigger scene update by resetting last selected
         last_selected.id = None;
 
-        // Reset selection if model not found
+        // Reset selection if model not found in current filter
         if let Some(selected_id) = upload_state.selected_model {
-            if !state.models.iter().any(|(id, _, _)| *id == selected_id) {
-                info!("Selected model ID={} not found, resetting to All Models", selected_id);
+            let filtered_models: Vec<_> = state.models.iter()
+                .filter(|(_, _, _, file_type)| {
+                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
+                })
+                .collect();
+            
+            if !filtered_models.iter().any(|(id, _, _, _)| *id == selected_id) {
+                info!("Selected model ID={} not found in current filter, resetting to All Models", selected_id);
                 upload_state.selected_model = None;
             }
         }
