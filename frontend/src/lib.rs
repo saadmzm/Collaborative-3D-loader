@@ -1,6 +1,7 @@
 use bevy::{
     pbr::{ CascadeShadowConfigBuilder, DirectionalLightShadowMap },
     prelude::*,
+    render::{camera::Viewport, view::RenderLayers},
 };
 use bevy_panorbit_camera::{ PanOrbitCameraPlugin, PanOrbitCamera };
 use bevy_egui::{ egui, EguiContexts, EguiPlugin };
@@ -17,6 +18,18 @@ use futures_util::{ SinkExt, StreamExt };
 use uuid::Uuid;
 use base64::{ Engine as _, engine::general_purpose };
 use rfd::FileDialog;
+
+#[derive(Component)]
+enum ViewerCamera {
+    Viewer1,
+    Viewer2,
+}
+
+#[derive(Component, Clone, Copy, PartialEq)]
+enum ViewerLayer {
+    Viewer1,
+    Viewer2,
+}
 
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
@@ -38,7 +51,8 @@ struct ModelResponse {
 #[derive(Resource)]
 struct ModelState {
     models: Vec<(i32, String, Option<String>, String)>, // (id, temp_file_path, name, file_type)
-    model_entities: Vec<(i32, Entity)>,
+    viewer1_entities: Vec<(i32, Entity)>,
+    viewer2_entities: Vec<(i32, Entity)>,
 }
 
 #[derive(Resource)]
@@ -51,13 +65,15 @@ struct UploadState {
     file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
     file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
     model_name: String,
-    selected_model: Option<i32>, // None for "All Models", Some(id) for single model
+    viewer1_selected_model: Option<i32>, // None for "All Models", Some(id) for single model
+    viewer2_selected_model: Option<i32>, // None for "All Models", Some(id) for single model
     file_filter: String,        // Current file filter: "All", "gltf", "houdini_json"
 }
 
 #[derive(Resource, Default)]
 struct LastSelectedModel {
-    id: Option<i32>,
+    viewer1_id: Option<i32>,
+    viewer2_id: Option<i32>,
     filter: String,
 }
 
@@ -66,7 +82,7 @@ pub fn run() {
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "PGS Renderman - GLTF & Houdini JSON Viewer".to_string(),
+                title: "PGS Renderman - GLTF & Houdini JSON Viewer (Dual View)".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -79,10 +95,73 @@ pub fn run() {
             handle_model_updates,
             handle_file_results,
             update_scene_on_selection,
-            block_camera_on_egui
+            block_camera_on_egui,
+            setup_viewports,
+            assign_render_layers,
         ))
         .add_systems(Startup, debug_resources)
         .run();
+}
+
+fn assign_render_layers(
+    parent_query: Query<(Entity, &ViewerLayer, &RenderLayers)>,
+    children_query: Query<&Children>,
+    entity_query: Query<Entity, Without<RenderLayers>>,
+    mut commands: Commands,
+) {
+    for (parent_entity, _viewer_layer, parent_render_layer) in parent_query.iter() {
+        // Recursively check and add RenderLayers to all children that don't have it
+        propagate_render_layers_to_children(&mut commands, parent_entity, parent_render_layer.clone(), &children_query, &entity_query);
+    }
+}
+
+fn propagate_render_layers_to_children(
+    commands: &mut Commands,
+    entity: Entity,
+    render_layer: RenderLayers,
+    children_query: &Query<&Children>,
+    entity_query: &Query<Entity, Without<RenderLayers>>,
+) {
+    if let Ok(children) = children_query.get(entity) {
+        for child in children.iter() {
+            // Only add if the child doesn't have RenderLayers
+            if entity_query.get(*child).is_ok() {
+                commands.entity(*child).insert(render_layer.clone());
+            }
+            // Recursively process grandchildren
+            propagate_render_layers_to_children(commands, *child, render_layer.clone(), children_query, entity_query);
+        }
+    }
+}
+
+fn setup_viewports(
+    windows: Query<&Window>,
+    mut cameras: Query<(&mut Camera, &ViewerCamera)>,
+) {
+    let window = windows.single();
+    let window_width = window.physical_width();
+    let window_height = window.physical_height();
+    
+    let half_width = window_width / 2;
+
+    for (mut camera, viewer_camera) in cameras.iter_mut() {
+        match viewer_camera {
+            ViewerCamera::Viewer1 => {
+                camera.viewport = Some(Viewport {
+                    physical_position: UVec2::new(0, 0),
+                    physical_size: UVec2::new(half_width, window_height),
+                    ..default()
+                });
+            }
+            ViewerCamera::Viewer2 => {
+                camera.viewport = Some(Viewport {
+                    physical_position: UVec2::new(half_width, 0),
+                    physical_size: UVec2::new(half_width, window_height),
+                    ..default()
+                });
+            }
+        }
+    }
 }
 
 fn block_camera_on_egui(
@@ -96,9 +175,30 @@ fn block_camera_on_egui(
 }
 
 fn setup(mut commands: Commands) {
+    // Spawn Viewer 1 camera (left side) - Layer 0
     commands.spawn((
+        Camera3d::default(),
+        Camera {
+            order: 0,
+            ..default()
+        },
         Transform::from_translation(Vec3::new(-6.0, 5.0, 1.5)),
         PanOrbitCamera::default(),
+        ViewerCamera::Viewer1,
+        RenderLayers::layer(0),
+    ));
+
+    // Spawn Viewer 2 camera (right side) - Layer 1
+    commands.spawn((
+        Camera3d::default(),
+        Camera {
+            order: 1,
+            ..default()
+        },
+        Transform::from_translation(Vec3::new(-6.0, 5.0, 1.5)),
+        PanOrbitCamera::default(),
+        ViewerCamera::Viewer2,
+        RenderLayers::layer(1),
     ));
 
     commands.spawn((
@@ -112,11 +212,13 @@ fn setup(mut commands: Commands) {
             ..default()
         }
         .build(),
+        RenderLayers::layer(0).with(1), // Visible on both layers
     ));
 
     commands.insert_resource(ModelState {
         models: vec![],
-        model_entities: vec![],
+        viewer1_entities: vec![],
+        viewer2_entities: vec![],
     });
 
     let (update_tx, update_rx) = mpsc::channel(100);
@@ -129,11 +231,13 @@ fn setup(mut commands: Commands) {
         file_tx,
         file_rx,
         model_name: String::new(),
-        selected_model: None,
+        viewer1_selected_model: None,
+        viewer2_selected_model: None,
         file_filter: "All".to_string(),
     });
     commands.insert_resource(LastSelectedModel {
-        id: None,
+        viewer1_id: None,
+        viewer2_id: None,
         filter: "All".to_string(),
     });
 
@@ -358,7 +462,7 @@ fn ui_system(
             ui.label("• Houdini JSON (.json) - Geometry from Houdini");
         });
 
-    // Model Selection Window (centered)
+    // Model Selection Window (centered) - Now with two viewers
     egui::Window::new("Model Selection")
         .default_pos([640.0, 360.0]) // Center for 1280x720 window
         .show(contexts.ctx_mut(), |ui| {
@@ -368,7 +472,8 @@ fn ui_system(
                 })
                 .collect();
             
-            let selected_text = match upload_state.selected_model {
+            ui.heading("Viewer 1 (Left)");
+            let viewer1_selected_text = match upload_state.viewer1_selected_model {
                 None => "All Models".to_string(),
                 Some(id) => filtered_models
                     .iter()
@@ -385,11 +490,11 @@ fn ui_system(
                     .unwrap_or_else(|| "Model Not Found".to_string()),
             };
 
-            egui::ComboBox::from_label("Select Model")
-                .selected_text(selected_text)
+            egui::ComboBox::from_label("Select Model for Viewer 1")
+                .selected_text(viewer1_selected_text)
                 .show_ui(ui, |ui| {
                     // Option for All Models
-                    ui.selectable_value(&mut upload_state.selected_model, None, "All Models");
+                    ui.selectable_value(&mut upload_state.viewer1_selected_model, None, "All Models");
                     // Options for individual models (filtered)
                     for (id, _, name, file_type) in &filtered_models {
                         let file_prefix = match file_type.as_str() {
@@ -400,7 +505,45 @@ fn ui_system(
                         let display_name = name
                             .as_ref()
                             .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
-                        ui.selectable_value(&mut upload_state.selected_model, Some(*id), display_name);
+                        ui.selectable_value(&mut upload_state.viewer1_selected_model, Some(*id), display_name);
+                    }
+                });
+            
+            ui.separator();
+            ui.heading("Viewer 2 (Right)");
+            let viewer2_selected_text = match upload_state.viewer2_selected_model {
+                None => "All Models".to_string(),
+                Some(id) => filtered_models
+                    .iter()
+                    .find(|(model_id, _, _, _)| *model_id == id)
+                    .map(|(_, _, name, file_type)| {
+                        let file_prefix = match file_type.as_str() {
+                            "gltf" => "[GLTF]",
+                            "houdini_json" => "[Houdini]",
+                            _ => "[Unknown]"
+                        };
+                        name.as_ref()
+                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
+                    })
+                    .unwrap_or_else(|| "Model Not Found".to_string()),
+            };
+
+            egui::ComboBox::from_label("Select Model for Viewer 2")
+                .selected_text(viewer2_selected_text)
+                .show_ui(ui, |ui| {
+                    // Option for All Models
+                    ui.selectable_value(&mut upload_state.viewer2_selected_model, None, "All Models");
+                    // Options for individual models (filtered)
+                    for (id, _, name, file_type) in &filtered_models {
+                        let file_prefix = match file_type.as_str() {
+                            "gltf" => "[GLTF]",
+                            "houdini_json" => "[Houdini]",
+                            _ => "[Unknown]"
+                        };
+                        let display_name = name
+                            .as_ref()
+                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
+                        ui.selectable_value(&mut upload_state.viewer2_selected_model, Some(*id), display_name);
                     }
                 });
         });
@@ -464,51 +607,94 @@ fn update_scene_on_selection(
         .cloned()
         .collect();
     
-    // Check if scene needs update (selection or filter changed)
-    let should_update = last_selected.id != upload_state.selected_model ||
-        last_selected.filter != upload_state.file_filter ||
-        state.model_entities.iter().map(|(id, _)| *id).collect::<Vec<_>>() !=
-        match upload_state.selected_model {
-            Some(id) => filtered_models.iter()
-                .filter(|(mid, _, _, _)| *mid == id)
-                .map(|(id, _, _, _)| *id)
-                .collect::<Vec<_>>(),
-            None => filtered_models.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
-        };
+    // Check if Viewer 1 needs update
+    let viewer1_should_update = last_selected.viewer1_id != upload_state.viewer1_selected_model ||
+        last_selected.filter != upload_state.file_filter;
 
-    if should_update {
-        info!("Updating scene, selected: {:?}, filter: {}", upload_state.selected_model, upload_state.file_filter);
+    if viewer1_should_update {
+        info!("Updating Viewer 1 scene, selected: {:?}, filter: {}", upload_state.viewer1_selected_model, upload_state.file_filter);
 
-        // Despawn all existing entities
-        for (_, entity) in state.model_entities.drain(..) {
-            info!("Despawning entity for model");
+        // Despawn all existing entities in Viewer 1
+        for (_, entity) in state.viewer1_entities.drain(..) {
+            info!("Despawning entity for Viewer 1");
             commands.entity(entity).despawn();
         }
-        state.model_entities.clear();
+        state.viewer1_entities.clear();
 
-        // Load models based on selection and filter
-        let models_to_load = match upload_state.selected_model {
+        // Load models for Viewer 1
+        let models_to_load = match upload_state.viewer1_selected_model {
             Some(selected_id) => filtered_models
                 .iter()
                 .filter(|(id, _, _, _)| *id == selected_id)
                 .cloned()
                 .collect::<Vec<_>>(),
-            None => filtered_models,
+            None => filtered_models.clone(),
         };
 
-        // Spawn filtered models
+        // Spawn filtered models in Viewer 1
         for (id, temp_path_str, _name, file_type) in models_to_load {
-            info!("Loading model ID={} ({}) at path {}", id, file_type, temp_path_str);
+            info!("Loading model ID={} ({}) at path {} for Viewer 1", id, file_type, temp_path_str);
             let entity = commands
-                .spawn(SceneRoot(asset_server.load(
-                    GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
-                )))
+                .spawn((
+                    SceneRoot(asset_server.load(
+                        GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
+                    )),
+                    ViewerLayer::Viewer1,
+                    RenderLayers::layer(0),
+                ))
                 .id();
-            state.model_entities.push((id, entity));
+            state.viewer1_entities.push((id, entity));
         }
 
-        // Update last selected state
-        last_selected.id = upload_state.selected_model;
+        // Update last selected state for Viewer 1
+        last_selected.viewer1_id = upload_state.viewer1_selected_model;
+    }
+    
+    // Check if Viewer 2 needs update
+    let viewer2_should_update = last_selected.viewer2_id != upload_state.viewer2_selected_model ||
+        last_selected.filter != upload_state.file_filter;
+
+    if viewer2_should_update {
+        info!("Updating Viewer 2 scene, selected: {:?}, filter: {}", upload_state.viewer2_selected_model, upload_state.file_filter);
+
+        // Despawn all existing entities in Viewer 2
+        for (_, entity) in state.viewer2_entities.drain(..) {
+            info!("Despawning entity for Viewer 2");
+            commands.entity(entity).despawn();
+        }
+        state.viewer2_entities.clear();
+
+        // Load models for Viewer 2
+        let models_to_load = match upload_state.viewer2_selected_model {
+            Some(selected_id) => filtered_models
+                .iter()
+                .filter(|(id, _, _, _)| *id == selected_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            None => filtered_models.clone(),
+        };
+
+        // Spawn filtered models in Viewer 2
+        for (id, temp_path_str, _name, file_type) in models_to_load {
+            info!("Loading model ID={} ({}) at path {} for Viewer 2", id, file_type, temp_path_str);
+            let entity = commands
+                .spawn((
+                    SceneRoot(asset_server.load(
+                        GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
+                    )),
+                    ViewerLayer::Viewer2,
+                    RenderLayers::layer(1),
+                ))
+                .id();
+            state.viewer2_entities.push((id, entity));
+        }
+
+        // Update last selected state for Viewer 2
+        last_selected.viewer2_id = upload_state.viewer2_selected_model;
+    }
+    
+    // Update filter state
+    if last_selected.filter != upload_state.file_filter {
         last_selected.filter = upload_state.file_filter.clone();
     }
 }
@@ -520,7 +706,8 @@ fn handle_model_updates(
     mut last_selected: ResMut<LastSelectedModel>,
 ) {
     while let Ok(models) = receiver.0.try_recv() {
-        info!("Received {} models, selected: {:?}", models.len(), upload_state.selected_model);
+        info!("Received {} models, viewer1 selected: {:?}, viewer2 selected: {:?}", 
+              models.len(), upload_state.viewer1_selected_model, upload_state.viewer2_selected_model);
 
         // Update upload status if new models detected
         if !models.is_empty() && upload_state.status == "Upload queued" {
@@ -557,11 +744,12 @@ fn handle_model_updates(
         }
         state.models = new_models;
 
-        // Trigger scene update by resetting last selected
-        last_selected.id = None;
+        // Trigger scene update by resetting last selected for both viewers
+        last_selected.viewer1_id = None;
+        last_selected.viewer2_id = None;
 
-        // Reset selection if model not found in current filter
-        if let Some(selected_id) = upload_state.selected_model {
+        // Reset viewer 1 selection if model not found in current filter
+        if let Some(selected_id) = upload_state.viewer1_selected_model {
             let filtered_models: Vec<_> = state.models.iter()
                 .filter(|(_, _, _, file_type)| {
                     upload_state.file_filter == "All" || upload_state.file_filter == *file_type
@@ -569,8 +757,22 @@ fn handle_model_updates(
                 .collect();
             
             if !filtered_models.iter().any(|(id, _, _, _)| *id == selected_id) {
-                info!("Selected model ID={} not found in current filter, resetting to All Models", selected_id);
-                upload_state.selected_model = None;
+                info!("Viewer 1 selected model ID={} not found in current filter, resetting to All Models", selected_id);
+                upload_state.viewer1_selected_model = None;
+            }
+        }
+        
+        // Reset viewer 2 selection if model not found in current filter
+        if let Some(selected_id) = upload_state.viewer2_selected_model {
+            let filtered_models: Vec<_> = state.models.iter()
+                .filter(|(_, _, _, file_type)| {
+                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
+                })
+                .collect();
+            
+            if !filtered_models.iter().any(|(id, _, _, _)| *id == selected_id) {
+                info!("Viewer 2 selected model ID={} not found in current filter, resetting to All Models", selected_id);
+                upload_state.viewer2_selected_model = None;
             }
         }
     }
