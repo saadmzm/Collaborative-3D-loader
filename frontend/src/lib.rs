@@ -31,13 +31,20 @@ enum ViewerLayer {
     Viewer2,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AdditionalFile {
+    filename: String,
+    data: String, // base64-encoded
+}
+
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
     action: String,
     id: Option<i32>,
     name: Option<String>,
     model_data: Option<String>, // base64-encoded
-    file_type: Option<String>,  // "gltf" or "houdini_json"
+    file_type: Option<String>,
+    additional_files: Option<Vec<AdditionalFile>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -46,6 +53,8 @@ struct ModelResponse {
     name: Option<String>,
     model_data: String, // base64-encoded
     file_type: String,  // "gltf" or "houdini_json"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_files: Option<Vec<AdditionalFile>>,
 }
 
 #[derive(Resource)]
@@ -62,12 +71,12 @@ struct ModelUpdateReceiver(mpsc::Receiver<Vec<ModelResponse>>);
 struct UploadState {
     status: String,
     ws_tx: mpsc::Sender<String>,
-    file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
-    file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>, String), String>)>,
+    file_tx: mpsc::Sender<(String, Result<(Vec<u8>, Option<String>, String, Vec<AdditionalFile>), String>)>,
+    file_rx: mpsc::Receiver<(String, Result<(Vec<u8>, Option<String>, String, Vec<AdditionalFile>), String>)>,
     model_name: String,
-    viewer1_selected_model: Option<i32>, // None for "All Models", Some(id) for single model
-    viewer2_selected_model: Option<i32>, // None for "All Models", Some(id) for single model
-    file_filter: String,        // Current file filter: "All", "gltf", "houdini_json"
+    viewer1_selected_model: Option<i32>,
+    viewer2_selected_model: Option<i32>,
+    file_filter: String,
 }
 
 #[derive(Resource, Default)]
@@ -110,7 +119,6 @@ fn assign_render_layers(
     mut commands: Commands,
 ) {
     for (parent_entity, _viewer_layer, parent_render_layer) in parent_query.iter() {
-        // Recursively check and add RenderLayers to all children that don't have it
         propagate_render_layers_to_children(&mut commands, parent_entity, parent_render_layer.clone(), &children_query, &entity_query);
     }
 }
@@ -124,11 +132,9 @@ fn propagate_render_layers_to_children(
 ) {
     if let Ok(children) = children_query.get(entity) {
         for child in children.iter() {
-            // Only add if the child doesn't have RenderLayers
             if entity_query.get(*child).is_ok() {
                 commands.entity(*child).insert(render_layer.clone());
             }
-            // Recursively process grandchildren
             propagate_render_layers_to_children(commands, *child, render_layer.clone(), children_query, entity_query);
         }
     }
@@ -175,7 +181,6 @@ fn block_camera_on_egui(
 }
 
 fn setup(mut commands: Commands) {
-    // Spawn Viewer 1 camera (left side) - Layer 0
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -188,7 +193,6 @@ fn setup(mut commands: Commands) {
         RenderLayers::layer(0),
     ));
 
-    // Spawn Viewer 2 camera (right side) - Layer 1
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -212,7 +216,7 @@ fn setup(mut commands: Commands) {
             ..default()
         }
         .build(),
-        RenderLayers::layer(0).with(1), // Visible on both layers
+        RenderLayers::layer(0).with(1),
     ));
 
     commands.insert_resource(ModelState {
@@ -262,6 +266,7 @@ fn setup(mut commands: Commands) {
                             name: None,
                             model_data: None,
                             file_type: None,
+                            additional_files: None,
                         };
                         let request_str = serde_json::to_string(&request).unwrap();
                         if let Err(e) = ws_stream
@@ -336,7 +341,6 @@ fn ui_system(
     state: Res<ModelState>,
     mut upload_state: ResMut<UploadState>,
 ) {
-    // Model List Window (default position, left side)
     egui::Window::new("Model List").show(contexts.ctx_mut(), |ui| {
         ui.label("File Type Filter:");
         egui::ComboBox::from_label("Filter")
@@ -375,6 +379,7 @@ fn ui_system(
                         name: None,
                         model_data: None,
                         file_type: None,
+                        additional_files: None,
                     };
                     let request_str = serde_json::to_string(&request).unwrap();
                     if let Err(e) = upload_state.ws_tx.try_send(request_str) {
@@ -385,9 +390,8 @@ fn ui_system(
         }
     });
 
-    // Upload Model Window (positioned on the right)
     egui::Window::new("Upload Model")
-        .default_pos([1000.0, 50.0]) // Right side for 1280x720 window
+        .default_pos([1000.0, 50.0])
         .show(contexts.ctx_mut(), |ui| {
             ui.label("Model Name:");
             ui.text_edit_singleline(&mut upload_state.model_name);
@@ -411,7 +415,49 @@ fn ui_system(
                                     .and_then(|stem| stem.to_str())
                                     .map(|s| s.to_string());
                                 match std::fs::read(&path) {
-                                    Ok(data) => (path_str, Ok((data, file_name, "gltf".to_string()))),
+                                    Ok(main_data) => {
+                                        let mut additional_files = Vec::new();
+                                        
+                                        if let Ok(gltf_text) = std::str::from_utf8(&main_data) {
+                                            if let Ok(gltf_json) = serde_json::from_str::<serde_json::Value>(gltf_text) {
+                                                let parent_dir = path.parent().unwrap();
+                                                
+                                                if let Some(buffers) = gltf_json.get("buffers").and_then(|b| b.as_array()) {
+                                                    for buffer in buffers {
+                                                        if let Some(uri) = buffer.get("uri").and_then(|u| u.as_str()) {
+                                                            if !uri.starts_with("data:") {
+                                                                let bin_path = parent_dir.join(uri);
+                                                                if let Ok(bin_data) = std::fs::read(&bin_path) {
+                                                                    additional_files.push(AdditionalFile {
+                                                                        filename: uri.to_string(),
+                                                                        data: general_purpose::STANDARD.encode(&bin_data),
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if let Some(images) = gltf_json.get("images").and_then(|i| i.as_array()) {
+                                                    for image in images {
+                                                        if let Some(uri) = image.get("uri").and_then(|u| u.as_str()) {
+                                                            if !uri.starts_with("data:") {
+                                                                let img_path = parent_dir.join(uri);
+                                                                if let Ok(img_data) = std::fs::read(&img_path) {
+                                                                    additional_files.push(AdditionalFile {
+                                                                        filename: uri.to_string(),
+                                                                        data: general_purpose::STANDARD.encode(&img_data),
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        (path_str, Ok((main_data, file_name, "gltf".to_string(), additional_files)))
+                                    }
                                     Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
                                 }
                             } else {
@@ -439,7 +485,7 @@ fn ui_system(
                                     .and_then(|stem| stem.to_str())
                                     .map(|s| s.to_string());
                                 match std::fs::read(&path) {
-                                    Ok(data) => (path_str, Ok((data, file_name, "houdini_json".to_string()))),
+                                    Ok(data) => (path_str, Ok((data, file_name, "houdini_json".to_string(), Vec::new()))),
                                     Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
                                 }
                             } else {
@@ -459,12 +505,12 @@ fn ui_system(
             ui.separator();
             ui.label("Supported Formats:");
             ui.label("• GLTF (.gltf) - Standard 3D format");
+            ui.label("  (Automatically includes .bin & textures)");
             ui.label("• Houdini JSON (.json) - Geometry from Houdini");
         });
 
-    // Model Selection Window (centered) - Now with two viewers
     egui::Window::new("Model Selection")
-        .default_pos([640.0, 360.0]) // Center for 1280x720 window
+        .default_pos([640.0, 360.0])
         .show(contexts.ctx_mut(), |ui| {
             let filtered_models: Vec<_> = state.models.iter()
                 .filter(|(_, _, _, file_type)| {
@@ -493,9 +539,7 @@ fn ui_system(
             egui::ComboBox::from_label("Select Model for Viewer 1")
                 .selected_text(viewer1_selected_text)
                 .show_ui(ui, |ui| {
-                    // Option for All Models
                     ui.selectable_value(&mut upload_state.viewer1_selected_model, None, "All Models");
-                    // Options for individual models (filtered)
                     for (id, _, name, file_type) in &filtered_models {
                         let file_prefix = match file_type.as_str() {
                             "gltf" => "[GLTF]",
@@ -531,9 +575,7 @@ fn ui_system(
             egui::ComboBox::from_label("Select Model for Viewer 2")
                 .selected_text(viewer2_selected_text)
                 .show_ui(ui, |ui| {
-                    // Option for All Models
                     ui.selectable_value(&mut upload_state.viewer2_selected_model, None, "All Models");
-                    // Options for individual models (filtered)
                     for (id, _, name, file_type) in &filtered_models {
                         let file_prefix = match file_type.as_str() {
                             "gltf" => "[GLTF]",
@@ -549,13 +591,10 @@ fn ui_system(
         });
 }
 
-fn handle_file_results(
-    mut upload_state: ResMut<UploadState>,
-) {
+fn handle_file_results(mut upload_state: ResMut<UploadState>) {
     while let Ok((path, result)) = upload_state.file_rx.try_recv() {
         match result {
-            Ok((data, file_name, file_type)) => {
-                // Set model_name to file_name if not user-edited
+            Ok((data, file_name, file_type, additional_files)) => {
                 if upload_state.model_name.is_empty() {
                     if let Some(name) = &file_name {
                         upload_state.model_name = name.clone();
@@ -572,6 +611,11 @@ fn handle_file_results(
                     },
                     model_data: Some(base64_data),
                     file_type: Some(file_type),
+                    additional_files: if additional_files.is_empty() {
+                        None
+                    } else {
+                        Some(additional_files)
+                    },
                 };
                 let request_str = serde_json::to_string(&request).unwrap();
                 if let Err(e) = upload_state.ws_tx.try_send(request_str) {
@@ -579,7 +623,7 @@ fn handle_file_results(
                     error!("Failed to queue upload: {}", e);
                 } else {
                     upload_state.status = "Upload queued".to_string();
-                    upload_state.model_name.clear(); // Clear name for next upload
+                    upload_state.model_name.clear();
                 }
             }
             Err(e) => {
@@ -599,7 +643,6 @@ fn update_scene_on_selection(
     mut last_selected: ResMut<LastSelectedModel>,
     asset_server: Res<AssetServer>,
 ) {
-    // Filter models based on current filter
     let filtered_models: Vec<_> = state.models.iter()
         .filter(|(_, _, _, file_type)| {
             upload_state.file_filter == "All" || upload_state.file_filter == *file_type
@@ -607,21 +650,18 @@ fn update_scene_on_selection(
         .cloned()
         .collect();
     
-    // Check if Viewer 1 needs update
     let viewer1_should_update = last_selected.viewer1_id != upload_state.viewer1_selected_model ||
         last_selected.filter != upload_state.file_filter;
 
     if viewer1_should_update {
         info!("Updating Viewer 1 scene, selected: {:?}, filter: {}", upload_state.viewer1_selected_model, upload_state.file_filter);
 
-        // Despawn all existing entities in Viewer 1
         for (_, entity) in state.viewer1_entities.drain(..) {
             info!("Despawning entity for Viewer 1");
             commands.entity(entity).despawn();
         }
         state.viewer1_entities.clear();
 
-        // Load models for Viewer 1
         let models_to_load = match upload_state.viewer1_selected_model {
             Some(selected_id) => filtered_models
                 .iter()
@@ -631,7 +671,6 @@ fn update_scene_on_selection(
             None => filtered_models.clone(),
         };
 
-        // Spawn filtered models in Viewer 1
         for (id, temp_path_str, _name, file_type) in models_to_load {
             info!("Loading model ID={} ({}) at path {} for Viewer 1", id, file_type, temp_path_str);
             let entity = commands
@@ -646,25 +685,21 @@ fn update_scene_on_selection(
             state.viewer1_entities.push((id, entity));
         }
 
-        // Update last selected state for Viewer 1
         last_selected.viewer1_id = upload_state.viewer1_selected_model;
     }
     
-    // Check if Viewer 2 needs update
     let viewer2_should_update = last_selected.viewer2_id != upload_state.viewer2_selected_model ||
         last_selected.filter != upload_state.file_filter;
 
     if viewer2_should_update {
         info!("Updating Viewer 2 scene, selected: {:?}, filter: {}", upload_state.viewer2_selected_model, upload_state.file_filter);
 
-        // Despawn all existing entities in Viewer 2
         for (_, entity) in state.viewer2_entities.drain(..) {
             info!("Despawning entity for Viewer 2");
             commands.entity(entity).despawn();
         }
         state.viewer2_entities.clear();
 
-        // Load models for Viewer 2
         let models_to_load = match upload_state.viewer2_selected_model {
             Some(selected_id) => filtered_models
                 .iter()
@@ -674,7 +709,6 @@ fn update_scene_on_selection(
             None => filtered_models.clone(),
         };
 
-        // Spawn filtered models in Viewer 2
         for (id, temp_path_str, _name, file_type) in models_to_load {
             info!("Loading model ID={} ({}) at path {} for Viewer 2", id, file_type, temp_path_str);
             let entity = commands
@@ -689,11 +723,9 @@ fn update_scene_on_selection(
             state.viewer2_entities.push((id, entity));
         }
 
-        // Update last selected state for Viewer 2
         last_selected.viewer2_id = upload_state.viewer2_selected_model;
     }
     
-    // Update filter state
     if last_selected.filter != upload_state.file_filter {
         last_selected.filter = upload_state.file_filter.clone();
     }
@@ -709,12 +741,10 @@ fn handle_model_updates(
         info!("Received {} models, viewer1 selected: {:?}, viewer2 selected: {:?}", 
               models.len(), upload_state.viewer1_selected_model, upload_state.viewer2_selected_model);
 
-        // Update upload status if new models detected
         if !models.is_empty() && upload_state.status == "Upload queued" {
             upload_state.status = "Upload successful".to_string();
         }
 
-        // Update state.models with all models to keep dropdown accurate
         let mut new_models = vec![];
         for model in models {
             let temp_path = state
@@ -724,15 +754,34 @@ fn handle_model_updates(
                 .map(|(_, path, _, _)| path.clone())
                 .unwrap_or_else(|| {
                     let temp_dir = std::env::temp_dir();
+                    let model_dir_name = format!("model_{}", model.id);
+                    let model_dir = temp_dir.join(&model_dir_name);
+                    std::fs::create_dir_all(&model_dir).expect("Failed to create model directory");
+                    
                     let temp_file_name = format!("model_{}.gltf", model.id);
-                    let temp_path = temp_dir.join(&temp_file_name);
+                    let temp_path = model_dir.join(&temp_file_name);
                     let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
 
-                    // Write to temp file
                     match general_purpose::STANDARD.decode(&model.model_data) {
                         Ok(model_data) => {
                             let mut file = File::create(&temp_path).expect("Failed to create temp file");
                             file.write_all(&model_data).expect("Failed to write temp file");
+                            
+                            if let Some(additional_files) = &model.additional_files {
+                                info!("Writing {} additional files for model ID={}", additional_files.len(), model.id);
+                                for add_file in additional_files {
+                                    if let Ok(file_data) = general_purpose::STANDARD.decode(&add_file.data) {
+                                        let add_path = model_dir.join(&add_file.filename);
+                                        if let Some(parent) = add_path.parent() {
+                                            std::fs::create_dir_all(parent).ok();
+                                        }
+                                        if let Ok(mut f) = File::create(&add_path) {
+                                            f.write_all(&file_data).ok();
+                                            info!("Wrote additional file: {}", add_file.filename);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("Failed to decode base64 for model ID={}: {}", model.id, e);
@@ -744,11 +793,9 @@ fn handle_model_updates(
         }
         state.models = new_models;
 
-        // Trigger scene update by resetting last selected for both viewers
         last_selected.viewer1_id = None;
         last_selected.viewer2_id = None;
 
-        // Reset viewer 1 selection if model not found in current filter
         if let Some(selected_id) = upload_state.viewer1_selected_model {
             let filtered_models: Vec<_> = state.models.iter()
                 .filter(|(_, _, _, file_type)| {
@@ -762,7 +809,6 @@ fn handle_model_updates(
             }
         }
         
-        // Reset viewer 2 selection if model not found in current filter
         if let Some(selected_id) = upload_state.viewer2_selected_model {
             let filtered_models: Vec<_> = state.models.iter()
                 .filter(|(_, _, _, file_type)| {

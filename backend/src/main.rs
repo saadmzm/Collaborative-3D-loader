@@ -16,13 +16,20 @@ use base64::{ Engine as _, engine::general_purpose };
 mod houdini_json;
 use houdini_json::HoudiniJsonParser;
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
+struct AdditionalFile {
+    filename: String,
+    data: String, // base64-encoded
+}
+
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
     action: String,
     id: Option<i32>,
     name: Option<String>,
     model_data: Option<String>, // base64-encoded model data for insert
-    file_type: Option<String>,  // New field to specify file type: "gltf" or "houdini_json"
+    file_type: Option<String>,  // "gltf" or "houdini_json"
+    additional_files: Option<Vec<AdditionalFile>>, // For GLTF dependencies
 }
 
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Hash)]
@@ -30,7 +37,9 @@ struct ModelResponse {
     id: i32,
     name: Option<String>,
     model_data: String, // base64-encoded model data
-    file_type: String,  // "gltf" or "houdini_json" 
+    file_type: String,  // "gltf" or "houdini_json"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_files: Option<Vec<AdditionalFile>>, // For GLTF dependencies
 }
 
 #[derive(Debug)]
@@ -39,6 +48,7 @@ struct ModelData {
     name: Option<String>,
     model_data: Vec<u8>, // raw binary data
     file_type: String,   // "gltf" or "houdini_json"
+    additional_files: Option<String>, // JSON string of additional files
 }
 
 #[tokio::main]
@@ -46,6 +56,7 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:8000").await.expect("Failed to bind");
     println!("Backend WebSocket server running on ws://127.0.0.1:8000/ws");
     println!("Supported formats: GLTF (.gltf) and Houdini JSON (.json)");
+    println!("GLTF files can include external .bin and texture files");
 
     let (tx, _) = broadcast::channel(16);
 
@@ -57,11 +68,17 @@ async fn main() {
                 Ok(models) => {
                     let current_models: HashSet<ModelResponse> = models
                         .into_iter()
-                        .map(|m| ModelResponse {
-                            id: m.id,
-                            name: m.name,
-                            model_data: general_purpose::STANDARD.encode(&m.model_data),
-                            file_type: m.file_type,
+                        .map(|m| {
+                            let additional_files = m.additional_files.as_ref().and_then(|json_str| {
+                                serde_json::from_str::<Vec<AdditionalFile>>(json_str).ok()
+                            });
+                            ModelResponse {
+                                id: m.id,
+                                name: m.name,
+                                model_data: general_purpose::STANDARD.encode(&m.model_data),
+                                file_type: m.file_type,
+                                additional_files,
+                            }
                         })
                         .collect();
                     if current_models != last_models {
@@ -112,11 +129,15 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                     if let Some(id) = request.id {
                                         match load_model_by_id(id) {
                                             Ok(model) => {
+                                                let additional_files = model.additional_files.as_ref().and_then(|json_str| {
+                                                    serde_json::from_str::<Vec<AdditionalFile>>(json_str).ok()
+                                                });
                                                 let response = ModelResponse {
                                                     id: model.id,
                                                     name: model.name,
                                                     model_data: general_purpose::STANDARD.encode(&model.model_data),
                                                     file_type: model.file_type,
+                                                    additional_files,
                                                 };
                                                 let response_str = serde_json::to_string(&response).unwrap();
                                                 if let Err(e) = write
@@ -138,11 +159,17 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                         Ok(models) => {
                                             let response: Vec<ModelResponse> = models
                                                 .into_iter()
-                                                .map(|m| ModelResponse {
-                                                    id: m.id,
-                                                    name: m.name,
-                                                    model_data: general_purpose::STANDARD.encode(&m.model_data),
-                                                    file_type: m.file_type,
+                                                .map(|m| {
+                                                    let additional_files = m.additional_files.as_ref().and_then(|json_str| {
+                                                        serde_json::from_str::<Vec<AdditionalFile>>(json_str).ok()
+                                                    });
+                                                    ModelResponse {
+                                                        id: m.id,
+                                                        name: m.name,
+                                                        model_data: general_purpose::STANDARD.encode(&m.model_data),
+                                                        file_type: m.file_type,
+                                                        additional_files,
+                                                    }
                                                 })
                                                 .collect();
                                             let response_str = serde_json::to_string(&response).unwrap();
@@ -181,18 +208,31 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                                     raw_data
                                                 };
                                                 
-                                                match insert_model(&final_data, request.name.as_deref(), &file_type) {
+                                                // Serialize additional files to JSON if present
+                                                let additional_files_json = request.additional_files.as_ref().and_then(|files| {
+                                                    serde_json::to_string(files).ok()
+                                                });
+                                                
+                                                match insert_model(&final_data, request.name.as_deref(), &file_type, additional_files_json.as_deref()) {
                                                     Ok(_new_id) => {
+                                                        println!("Model inserted successfully with {} additional files", 
+                                                            request.additional_files.as_ref().map(|f| f.len()).unwrap_or(0));
                                                         // Broadcast updated model list instead of single model
                                                         match load_all_models() {
                                                             Ok(models) => {
                                                                 let response: Vec<ModelResponse> = models
                                                                     .into_iter()
-                                                                    .map(|m| ModelResponse {
-                                                                        id: m.id,
-                                                                        name: m.name,
-                                                                        model_data: general_purpose::STANDARD.encode(&m.model_data),
-                                                                        file_type: m.file_type,
+                                                                    .map(|m| {
+                                                                        let additional_files = m.additional_files.as_ref().and_then(|json_str| {
+                                                                            serde_json::from_str::<Vec<AdditionalFile>>(json_str).ok()
+                                                                        });
+                                                                        ModelResponse {
+                                                                            id: m.id,
+                                                                            name: m.name,
+                                                                            model_data: general_purpose::STANDARD.encode(&m.model_data),
+                                                                            file_type: m.file_type,
+                                                                            additional_files,
+                                                                        }
                                                                     })
                                                                     .collect();
                                                                 let update = serde_json::to_string(&response).unwrap();
@@ -232,15 +272,21 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                                     Ok(models) => {
                                                         let response: Vec<ModelResponse> = models
                                                             .into_iter()
-                                                            .map(|m| ModelResponse {
-                                                                id: m.id,
-                                                                name: m.name,
-                                                                model_data: general_purpose::STANDARD.encode(&m.model_data),
-                                                                file_type: m.file_type,
+                                                            .map(|m| {
+                                                                let additional_files = m.additional_files.as_ref().and_then(|json_str| {
+                                                                    serde_json::from_str::<Vec<AdditionalFile>>(json_str).ok()
+                                                                });
+                                                                ModelResponse {
+                                                                    id: m.id,
+                                                                    name: m.name,
+                                                                    model_data: general_purpose::STANDARD.encode(&m.model_data),
+                                                                    file_type: m.file_type,
+                                                                    additional_files,
+                                                                }
                                                             })
                                                             .collect();
                                                         let update = serde_json::to_string(&response).unwrap();
-                                                        println!("Broadcasting model list after insert: {} models", response.len());
+                                                        println!("Broadcasting model list after delete: {} models", response.len());
                                                         if let Err(e) = tx.send(update) {
                                                             eprintln!("Broadcast error: {:?}", e);
                                                         }
@@ -356,6 +402,18 @@ fn process_houdini_json(data: &[u8]) -> Result<Vec<u8>, String> {
 fn init_db() -> Result<Connection> {
     let conn = Connection::open("models.db")?;
     
+    // Migration: Add additional_files column if it doesn't exist
+    conn.execute(
+        "ALTER TABLE models ADD COLUMN additional_files TEXT",
+        params![],
+    )
+    .unwrap_or_else(|e| {
+        if !e.to_string().contains("duplicate column name") {
+            panic!("Failed to add additional_files column: {}", e);
+        }
+        0
+    });
+    
     // Migration: Add file_type column if it doesn't exist
     conn.execute(
         "ALTER TABLE models ADD COLUMN file_type TEXT DEFAULT 'gltf'",
@@ -386,7 +444,8 @@ fn init_db() -> Result<Connection> {
             id INTEGER PRIMARY KEY,
             Name TEXT,
             model_data BLOB NOT NULL,
-            file_type TEXT DEFAULT 'gltf'
+            file_type TEXT DEFAULT 'gltf',
+            additional_files TEXT
         )",
         params![],
     )?;
@@ -396,13 +455,14 @@ fn init_db() -> Result<Connection> {
 
 fn load_model_by_id(model_id: i32) -> Result<ModelData> {
     let conn = init_db()?;
-    let mut stmt = conn.prepare("SELECT id, Name, model_data, COALESCE(file_type, 'gltf') FROM models WHERE id = ?1")?;
+    let mut stmt = conn.prepare("SELECT id, Name, model_data, COALESCE(file_type, 'gltf'), additional_files FROM models WHERE id = ?1")?;
     let model_data = stmt.query_row(params![model_id], |row| {
         Ok(ModelData {
             id: row.get(0)?,
             name: row.get(1)?,
             model_data: row.get(2)?,
             file_type: row.get(3)?,
+            additional_files: row.get(4)?,
         })
     })?;
     Ok(model_data)
@@ -410,13 +470,14 @@ fn load_model_by_id(model_id: i32) -> Result<ModelData> {
 
 fn load_all_models() -> Result<Vec<ModelData>> {
     let conn = init_db()?;
-    let mut stmt = conn.prepare("SELECT id, Name, model_data, COALESCE(file_type, 'gltf') FROM models")?;
+    let mut stmt = conn.prepare("SELECT id, Name, model_data, COALESCE(file_type, 'gltf'), additional_files FROM models")?;
     let model_iter = stmt.query_map(params![], |row| {
         Ok(ModelData {
             id: row.get(0)?,
             name: row.get(1)?,
             model_data: row.get(2)?,
             file_type: row.get(3)?,
+            additional_files: row.get(4)?,
         })
     })?;
     let mut models = Vec::new();
@@ -426,11 +487,11 @@ fn load_all_models() -> Result<Vec<ModelData>> {
     Ok(models)
 }
 
-fn insert_model(model_data: &[u8], name: Option<&str>, file_type: &str) -> Result<i32> {
+fn insert_model(model_data: &[u8], name: Option<&str>, file_type: &str, additional_files: Option<&str>) -> Result<i32> {
     let conn = init_db()?;
     conn.execute(
-        "INSERT INTO models (Name, model_data, file_type) VALUES (?1, ?2, ?3)", 
-        params![name, model_data, file_type]
+        "INSERT INTO models (Name, model_data, file_type, additional_files) VALUES (?1, ?2, ?3, ?4)", 
+        params![name, model_data, file_type, additional_files]
     )?;
     Ok(conn.last_insert_rowid() as i32)
 }
