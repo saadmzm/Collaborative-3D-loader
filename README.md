@@ -40,6 +40,5 @@ python3 -m http.server 3000
 
 ## Additional Notes
 
-- You can add 3D models from the Dialog box in the native client window.
-- Currently only Embedded Gltf 3D models work, more formats will be added in future.
-- Web clients can only load and view the 3d models.
+- You can add GLTF models from the Dialog box in the native client window.
+- The Houdini JSON is specifically for JSON files exported from Houdini only.
