@@ -31,6 +31,12 @@ enum ViewerLayer {
     Viewer2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ViewMode {
+    Dual,
+    Single,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AdditionalFile {
     filename: String,
@@ -77,6 +83,7 @@ struct UploadState {
     viewer1_selected_model: Option<i32>,
     viewer2_selected_model: Option<i32>,
     file_filter: String,
+    view_mode: ViewMode,
 }
 
 #[derive(Resource, Default)]
@@ -91,7 +98,7 @@ pub fn run() {
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "PGS Renderman - GLTF & Houdini JSON Viewer (Dual View)".to_string(),
+                title: "GLTF Loader".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -143,28 +150,51 @@ fn propagate_render_layers_to_children(
 fn setup_viewports(
     windows: Query<&Window>,
     mut cameras: Query<(&mut Camera, &ViewerCamera)>,
+    upload_state: Res<UploadState>,
 ) {
     let window = windows.single();
     let window_width = window.physical_width();
     let window_height = window.physical_height();
-    
-    let half_width = window_width / 2;
 
-    for (mut camera, viewer_camera) in cameras.iter_mut() {
-        match viewer_camera {
-            ViewerCamera::Viewer1 => {
-                camera.viewport = Some(Viewport {
-                    physical_position: UVec2::new(0, 0),
-                    physical_size: UVec2::new(half_width, window_height),
-                    ..default()
-                });
+    match upload_state.view_mode {
+        ViewMode::Dual => {
+            let half_width = window_width / 2;
+            
+            for (mut camera, viewer_camera) in cameras.iter_mut() {
+                camera.is_active = true;
+                match viewer_camera {
+                    ViewerCamera::Viewer1 => {
+                        camera.viewport = Some(Viewport {
+                            physical_position: UVec2::new(0, 0),
+                            physical_size: UVec2::new(half_width, window_height),
+                            ..default()
+                        });
+                    }
+                    ViewerCamera::Viewer2 => {
+                        camera.viewport = Some(Viewport {
+                            physical_position: UVec2::new(half_width, 0),
+                            physical_size: UVec2::new(half_width, window_height),
+                            ..default()
+                        });
+                    }
+                }
             }
-            ViewerCamera::Viewer2 => {
-                camera.viewport = Some(Viewport {
-                    physical_position: UVec2::new(half_width, 0),
-                    physical_size: UVec2::new(half_width, window_height),
-                    ..default()
-                });
+        }
+        ViewMode::Single => {
+            for (mut camera, viewer_camera) in cameras.iter_mut() {
+                match viewer_camera {
+                    ViewerCamera::Viewer1 => {
+                        camera.is_active = true;
+                        camera.viewport = Some(Viewport {
+                            physical_position: UVec2::new(0, 0),
+                            physical_size: UVec2::new(window_width, window_height),
+                            ..default()
+                        });
+                    }
+                    ViewerCamera::Viewer2 => {
+                        camera.is_active = false;
+                    }
+                }
             }
         }
     }
@@ -238,6 +268,7 @@ fn setup(mut commands: Commands) {
         viewer1_selected_model: None,
         viewer2_selected_model: None,
         file_filter: "All".to_string(),
+        view_mode: ViewMode::Single,
     });
     commands.insert_resource(LastSelectedModel {
         viewer1_id: None,
@@ -512,13 +543,25 @@ fn ui_system(
     egui::Window::new("Model Selection")
         .default_pos([640.0, 360.0])
         .show(contexts.ctx_mut(), |ui| {
+            // View Mode Toggle
+            ui.horizontal(|ui| {
+                if ui.selectable_label(upload_state.view_mode == ViewMode::Single, "Single View").clicked() {
+                    upload_state.view_mode = ViewMode::Single;
+                }
+                if ui.selectable_label(upload_state.view_mode == ViewMode::Dual, "Dual View").clicked() {
+                    upload_state.view_mode = ViewMode::Dual;
+                }
+            });
+            
+            ui.separator();
+            
             let filtered_models: Vec<_> = state.models.iter()
                 .filter(|(_, _, _, file_type)| {
                     upload_state.file_filter == "All" || upload_state.file_filter == *file_type
                 })
                 .collect();
             
-            ui.heading("Viewer 1 (Left)");
+            ui.heading("Viewer 1");
             let viewer1_selected_text = match upload_state.viewer1_selected_model {
                 None => "All Models".to_string(),
                 Some(id) => filtered_models
@@ -553,41 +596,44 @@ fn ui_system(
                     }
                 });
             
-            ui.separator();
-            ui.heading("Viewer 2 (Right)");
-            let viewer2_selected_text = match upload_state.viewer2_selected_model {
-                None => "All Models".to_string(),
-                Some(id) => filtered_models
-                    .iter()
-                    .find(|(model_id, _, _, _)| *model_id == id)
-                    .map(|(_, _, name, file_type)| {
-                        let file_prefix = match file_type.as_str() {
-                            "gltf" => "[GLTF]",
-                            "houdini_json" => "[Houdini]",
-                            _ => "[Unknown]"
-                        };
-                        name.as_ref()
-                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
-                    })
-                    .unwrap_or_else(|| "Model Not Found".to_string()),
-            };
+            // Only show Viewer 2 controls in Dual View mode
+            if upload_state.view_mode == ViewMode::Dual {
+                ui.separator();
+                ui.heading("Viewer 2");
+                let viewer2_selected_text = match upload_state.viewer2_selected_model {
+                    None => "All Models".to_string(),
+                    Some(id) => filtered_models
+                        .iter()
+                        .find(|(model_id, _, _, _)| *model_id == id)
+                        .map(|(_, _, name, file_type)| {
+                            let file_prefix = match file_type.as_str() {
+                                "gltf" => "[GLTF]",
+                                "houdini_json" => "[Houdini]",
+                                _ => "[Unknown]"
+                            };
+                            name.as_ref()
+                                .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
+                        })
+                        .unwrap_or_else(|| "Model Not Found".to_string()),
+                };
 
-            egui::ComboBox::from_label("Select Model for Viewer 2")
-                .selected_text(viewer2_selected_text)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut upload_state.viewer2_selected_model, None, "All Models");
-                    for (id, _, name, file_type) in &filtered_models {
-                        let file_prefix = match file_type.as_str() {
-                            "gltf" => "[GLTF]",
-                            "houdini_json" => "[Houdini]",
-                            _ => "[Unknown]"
-                        };
-                        let display_name = name
-                            .as_ref()
-                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
-                        ui.selectable_value(&mut upload_state.viewer2_selected_model, Some(*id), display_name);
-                    }
-                });
+                egui::ComboBox::from_label("Select Model for Viewer 2")
+                    .selected_text(viewer2_selected_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut upload_state.viewer2_selected_model, None, "All Models");
+                        for (id, _, name, file_type) in &filtered_models {
+                            let file_prefix = match file_type.as_str() {
+                                "gltf" => "[GLTF]",
+                                "houdini_json" => "[Houdini]",
+                                _ => "[Unknown]"
+                            };
+                            let display_name = name
+                                .as_ref()
+                                .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
+                            ui.selectable_value(&mut upload_state.viewer2_selected_model, Some(*id), display_name);
+                        }
+                    });
+            }
         });
 }
 
