@@ -286,8 +286,8 @@ fn setup(mut commands: Commands) {
             let connection_id = Uuid::new_v4().to_string();
             loop {
                 let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-                config.max_message_size = Some(100 * 1024 * 1024);
-                config.max_frame_size = Some(100 * 1024 * 1024);
+                config.max_message_size = Some(500 * 1024 * 1024);
+                config.max_frame_size = Some(500 * 1024 * 1024);
                 config.accept_unmasked_frames = false;
                 match connect_async_with_config("ws://127.0.0.1:8000/ws", Some(config), false).await {
                     Ok((mut ws_stream, _)) => {
