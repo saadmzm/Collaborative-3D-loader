@@ -11,6 +11,7 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
+    collections::HashMap,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::{ connect_async_with_config, tungstenite::Message };
@@ -43,6 +44,14 @@ struct AdditionalFile {
     data: String, // base64-encoded
 }
 
+// Lightweight model list item (matches backend)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ModelListItem {
+    id: i32,
+    name: Option<String>,
+    file_type: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ModelRequest {
     action: String,
@@ -53,25 +62,30 @@ struct ModelRequest {
     additional_files: Option<Vec<AdditionalFile>>,
 }
 
+// Full model response (for get_by_id)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ModelResponse {
     id: i32,
     name: Option<String>,
     model_data: String, // base64-encoded
-    file_type: String,  // "gltf" or "houdini_json"
+    file_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     additional_files: Option<Vec<AdditionalFile>>,
 }
 
 #[derive(Resource)]
 struct ModelState {
-    models: Vec<(i32, String, Option<String>, String)>, // (id, temp_file_path, name, file_type)
+    available_models: Vec<ModelListItem>, // Lightweight list from server
+    loaded_models: HashMap<i32, String>, // id -> temp_file_path (models we've downloaded)
     viewer1_entities: Vec<(i32, Entity)>,
     viewer2_entities: Vec<(i32, Entity)>,
 }
 
 #[derive(Resource)]
-struct ModelUpdateReceiver(mpsc::Receiver<Vec<ModelResponse>>);
+struct ModelListReceiver(mpsc::Receiver<Vec<ModelListItem>>);
+
+#[derive(Resource)]
+struct ModelDataReceiver(mpsc::Receiver<ModelResponse>);
 
 #[derive(Resource)]
 struct UploadState {
@@ -84,6 +98,7 @@ struct UploadState {
     viewer2_selected_model: Option<i32>,
     file_filter: String,
     view_mode: ViewMode,
+    pending_model_requests: Vec<i32>, // Models we're waiting to download
 }
 
 #[derive(Resource, Default)]
@@ -108,7 +123,8 @@ pub fn run() {
         .add_systems(Startup, setup)
         .add_systems(Update, (
             ui_system,
-            handle_model_updates,
+            handle_model_list_updates,
+            handle_model_data_updates,
             handle_file_results,
             update_scene_on_selection,
             block_camera_on_egui,
@@ -250,15 +266,19 @@ fn setup(mut commands: Commands) {
     ));
 
     commands.insert_resource(ModelState {
-        models: vec![],
+        available_models: vec![],
+        loaded_models: HashMap::new(),
         viewer1_entities: vec![],
         viewer2_entities: vec![],
     });
 
-    let (update_tx, update_rx) = mpsc::channel(100);
+    let (list_tx, list_rx) = mpsc::channel(100);
+    let (data_tx, data_rx) = mpsc::channel(100);
     let (ws_tx, mut ws_rx) = mpsc::channel(100);
     let (file_tx, file_rx) = mpsc::channel(1);
-    commands.insert_resource(ModelUpdateReceiver(update_rx));
+    
+    commands.insert_resource(ModelListReceiver(list_rx));
+    commands.insert_resource(ModelDataReceiver(data_rx));
     commands.insert_resource(UploadState {
         status: "Ready".to_string(),
         ws_tx,
@@ -269,6 +289,7 @@ fn setup(mut commands: Commands) {
         viewer2_selected_model: None,
         file_filter: "All".to_string(),
         view_mode: ViewMode::Single,
+        pending_model_requests: Vec::new(),
     });
     commands.insert_resource(LastSelectedModel {
         viewer1_id: None,
@@ -316,16 +337,22 @@ fn setup(mut commands: Commands) {
                                 Some(message_result) = ws_stream.next() => {
                                     match message_result {
                                         Ok(Message::Text(text)) => {
-                                            match serde_json::from_str::<Vec<ModelResponse>>(&text) {
-                                                Ok(models) => {
-                                                    if let Err(e) = update_tx.send(models).await {
-                                                        error!("Connection {}: Failed to send models to channel: {}", connection_id, e);
-                                                        break;
-                                                    }
+                                            // Try parsing as lightweight model list first
+                                            if let Ok(list) = serde_json::from_str::<Vec<ModelListItem>>(&text) {
+                                                if let Err(e) = list_tx.send(list).await {
+                                                    error!("Connection {}: Failed to send model list: {}", connection_id, e);
+                                                    break;
                                                 }
-                                                Err(e) => {
-                                                    error!("Connection {}: Failed to parse WebSocket message: {}", connection_id, e);
+                                            } 
+                                            // Try parsing as full model response (from get_by_id)
+                                            else if let Ok(model) = serde_json::from_str::<ModelResponse>(&text) {
+                                                if let Err(e) = data_tx.send(model).await {
+                                                    error!("Connection {}: Failed to send model data: {}", connection_id, e);
+                                                    break;
                                                 }
+                                            }
+                                            else {
+                                                warn!("Connection {}: Unexpected message format: {}", connection_id, &text[..100.min(text.len())]);
                                             }
                                         }
                                         Ok(Message::Ping(_)) => {
@@ -349,7 +376,7 @@ fn setup(mut commands: Commands) {
                                 }
                                 Some(upload_request) = ws_rx.recv() => {
                                     if let Err(e) = ws_stream.send(Message::Text(upload_request.into())).await {
-                                        error!("Connection {}: Failed to send upload request: {}", connection_id, e);
+                                        error!("Connection {}: Failed to send request: {}", connection_id, e);
                                         break;
                                     }
                                 }
@@ -383,42 +410,49 @@ fn ui_system(
             });
         
         ui.separator();
-        ui.label("Loaded Models:");
+        ui.label(format!("Available Models: {}", state.available_models.len()));
+        ui.label(format!("Loaded Models: {}", state.loaded_models.len()));
+        ui.separator();
         
-        let filtered_models: Vec<_> = state.models.iter()
-            .filter(|(_, _, _, file_type)| {
-                upload_state.file_filter == "All" || upload_state.file_filter == *file_type
-            })
+        let filtered_models: Vec<_> = state.available_models.iter()
+            .filter(|m| upload_state.file_filter == "All" || upload_state.file_filter == m.file_type)
             .collect();
         
-        for (id, _path, name, file_type) in &filtered_models {
-            let display_name = name
-                .as_ref()
-                .map_or_else(|| format!("Model {}", id), |n| n.clone());
-            let file_type_display = match file_type.as_str() {
-                "gltf" => "GLTF",
-                "houdini_json" => "Houdini",
-                _ => "Unknown"
-            };
-            
-            ui.horizontal(|ui| {
-                ui.label(format!("[{}] {}. {}", file_type_display, id, display_name));
-                if ui.button("Delete").clicked() {
-                    let request = ModelRequest {
-                        action: "delete".to_string(),
-                        id: Some(*id),
-                        name: None,
-                        model_data: None,
-                        file_type: None,
-                        additional_files: None,
-                    };
-                    let request_str = serde_json::to_string(&request).unwrap();
-                    if let Err(e) = upload_state.ws_tx.try_send(request_str) {
-                        error!("Failed to send delete request for ID {}: {}", id, e);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for model in &filtered_models {
+                let display_name = model.name
+                    .as_ref()
+                    .map_or_else(|| format!("Model {}", model.id), |n| n.clone());
+                let file_type_display = match model.file_type.as_str() {
+                    "gltf" => "GLTF",
+                    "houdini_json" => "Houdini",
+                    _ => "Unknown"
+                };
+                let loaded_indicator = if state.loaded_models.contains_key(&model.id) {
+                    "✓"
+                } else {
+                    " "
+                };
+                
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} [{}] {}. {}", loaded_indicator, file_type_display, model.id, display_name));
+                    if ui.button("Delete").clicked() {
+                        let request = ModelRequest {
+                            action: "delete".to_string(),
+                            id: Some(model.id),
+                            name: None,
+                            model_data: None,
+                            file_type: None,
+                            additional_files: None,
+                        };
+                        let request_str = serde_json::to_string(&request).unwrap();
+                        if let Err(e) = upload_state.ws_tx.try_send(request_str) {
+                            error!("Failed to send delete request for ID {}: {}", model.id, e);
+                        }
                     }
-                }
-            });
-        }
+                });
+            }
+        });
     });
 
     egui::Window::new("Upload Model")
@@ -543,7 +577,6 @@ fn ui_system(
     egui::Window::new("Model Selection")
         .default_pos([640.0, 360.0])
         .show(contexts.ctx_mut(), |ui| {
-            // View Mode Toggle
             ui.horizontal(|ui| {
                 if ui.selectable_label(upload_state.view_mode == ViewMode::Single, "Single View").clicked() {
                     upload_state.view_mode = ViewMode::Single;
@@ -555,10 +588,8 @@ fn ui_system(
             
             ui.separator();
             
-            let filtered_models: Vec<_> = state.models.iter()
-                .filter(|(_, _, _, file_type)| {
-                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
-                })
+            let filtered_models: Vec<_> = state.available_models.iter()
+                .filter(|m| upload_state.file_filter == "All" || upload_state.file_filter == m.file_type)
                 .collect();
             
             ui.heading("Viewer 1");
@@ -566,14 +597,14 @@ fn ui_system(
                 None => "All Models".to_string(),
                 Some(id) => filtered_models
                     .iter()
-                    .find(|(model_id, _, _, _)| *model_id == id)
-                    .map(|(_, _, name, file_type)| {
-                        let file_prefix = match file_type.as_str() {
+                    .find(|m| m.id == id)
+                    .map(|m| {
+                        let file_prefix = match m.file_type.as_str() {
                             "gltf" => "[GLTF]",
                             "houdini_json" => "[Houdini]",
                             _ => "[Unknown]"
                         };
-                        name.as_ref()
+                        m.name.as_ref()
                             .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
                     })
                     .unwrap_or_else(|| "Model Not Found".to_string()),
@@ -583,20 +614,19 @@ fn ui_system(
                 .selected_text(viewer1_selected_text)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut upload_state.viewer1_selected_model, None, "All Models");
-                    for (id, _, name, file_type) in &filtered_models {
-                        let file_prefix = match file_type.as_str() {
+                    for model in &filtered_models {
+                        let file_prefix = match model.file_type.as_str() {
                             "gltf" => "[GLTF]",
                             "houdini_json" => "[Houdini]",
                             _ => "[Unknown]"
                         };
-                        let display_name = name
+                        let display_name = model.name
                             .as_ref()
-                            .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
-                        ui.selectable_value(&mut upload_state.viewer1_selected_model, Some(*id), display_name);
+                            .map_or_else(|| format!("{} Model {}", file_prefix, model.id), |n| format!("{} {}: {}", file_prefix, model.id, n));
+                        ui.selectable_value(&mut upload_state.viewer1_selected_model, Some(model.id), display_name);
                     }
                 });
             
-            // Only show Viewer 2 controls in Dual View mode
             if upload_state.view_mode == ViewMode::Dual {
                 ui.separator();
                 ui.heading("Viewer 2");
@@ -604,14 +634,14 @@ fn ui_system(
                     None => "All Models".to_string(),
                     Some(id) => filtered_models
                         .iter()
-                        .find(|(model_id, _, _, _)| *model_id == id)
-                        .map(|(_, _, name, file_type)| {
-                            let file_prefix = match file_type.as_str() {
+                        .find(|m| m.id == id)
+                        .map(|m| {
+                            let file_prefix = match m.file_type.as_str() {
                                 "gltf" => "[GLTF]",
                                 "houdini_json" => "[Houdini]",
                                 _ => "[Unknown]"
                             };
-                            name.as_ref()
+                            m.name.as_ref()
                                 .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n))
                         })
                         .unwrap_or_else(|| "Model Not Found".to_string()),
@@ -621,16 +651,16 @@ fn ui_system(
                     .selected_text(viewer2_selected_text)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut upload_state.viewer2_selected_model, None, "All Models");
-                        for (id, _, name, file_type) in &filtered_models {
-                            let file_prefix = match file_type.as_str() {
+                        for model in &filtered_models {
+                            let file_prefix = match model.file_type.as_str() {
                                 "gltf" => "[GLTF]",
                                 "houdini_json" => "[Houdini]",
                                 _ => "[Unknown]"
                             };
-                            let display_name = name
+                            let display_name = model.name
                                 .as_ref()
-                                .map_or_else(|| format!("{} Model {}", file_prefix, id), |n| format!("{} {}: {}", file_prefix, id, n));
-                            ui.selectable_value(&mut upload_state.viewer2_selected_model, Some(*id), display_name);
+                                .map_or_else(|| format!("{} Model {}", file_prefix, model.id), |n| format!("{} {}: {}", file_prefix, model.id, n));
+                            ui.selectable_value(&mut upload_state.viewer2_selected_model, Some(model.id), display_name);
                         }
                     });
             }
@@ -682,17 +712,125 @@ fn handle_file_results(mut upload_state: ResMut<UploadState>) {
     }
 }
 
+fn handle_model_list_updates(
+    mut state: ResMut<ModelState>,
+    mut receiver: ResMut<ModelListReceiver>,
+    mut upload_state: ResMut<UploadState>,
+    mut last_selected: ResMut<LastSelectedModel>,
+) {
+    while let Ok(model_list) = receiver.0.try_recv() {
+        info!("Received model list with {} items", model_list.len());
+        
+        if !model_list.is_empty() && upload_state.status == "Upload queued" {
+            upload_state.status = "Upload successful".to_string();
+        }
+        
+        // Update available models list
+        state.available_models = model_list.clone();
+        
+        // Remove loaded models that no longer exist on server
+        let available_ids: Vec<i32> = model_list.iter().map(|m| m.id).collect();
+        state.loaded_models.retain(|id, _| {
+            available_ids.contains(id)
+        });
+        
+        // Force scene update
+        last_selected.viewer1_id = None;
+        last_selected.viewer2_id = None;
+        
+        // Check if selected models still exist
+        if let Some(selected_id) = upload_state.viewer1_selected_model {
+            let filtered_models: Vec<_> = model_list.iter()
+                .filter(|m| upload_state.file_filter == "All" || upload_state.file_filter == m.file_type)
+                .collect();
+            
+            if !filtered_models.iter().any(|m| m.id == selected_id) {
+                info!("Viewer 1 selected model ID={} not found, resetting", selected_id);
+                upload_state.viewer1_selected_model = None;
+            }
+        }
+        
+        if let Some(selected_id) = upload_state.viewer2_selected_model {
+            let filtered_models: Vec<_> = model_list.iter()
+                .filter(|m| upload_state.file_filter == "All" || upload_state.file_filter == m.file_type)
+                .collect();
+            
+            if !filtered_models.iter().any(|m| m.id == selected_id) {
+                info!("Viewer 2 selected model ID={} not found, resetting", selected_id);
+                upload_state.viewer2_selected_model = None;
+            }
+        }
+    }
+}
+
+fn handle_model_data_updates(
+    mut state: ResMut<ModelState>,
+    mut receiver: ResMut<ModelDataReceiver>,
+    mut upload_state: ResMut<UploadState>,
+    mut last_selected: ResMut<LastSelectedModel>,
+) {
+    while let Ok(model) = receiver.0.try_recv() {
+        info!("Received model data for ID={}", model.id);
+        
+        // Remove from pending requests
+        upload_state.pending_model_requests.retain(|id| *id != model.id);
+        
+        // Create temp file for this model
+        let temp_dir = std::env::temp_dir();
+        let model_dir_name = format!("model_{}", model.id);
+        let model_dir = temp_dir.join(&model_dir_name);
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model directory");
+        
+        let temp_file_name = format!("model_{}.gltf", model.id);
+        let temp_path = model_dir.join(&temp_file_name);
+        let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
+        
+        match general_purpose::STANDARD.decode(&model.model_data) {
+            Ok(model_data) => {
+                let mut file = File::create(&temp_path).expect("Failed to create temp file");
+                file.write_all(&model_data).expect("Failed to write temp file");
+                
+                // Write additional files
+                if let Some(additional_files) = &model.additional_files {
+                    info!("Writing {} additional files for model ID={}", additional_files.len(), model.id);
+                    for add_file in additional_files {
+                        if let Ok(file_data) = general_purpose::STANDARD.decode(&add_file.data) {
+                            let add_path = model_dir.join(&add_file.filename);
+                            if let Some(parent) = add_path.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            if let Ok(mut f) = File::create(&add_path) {
+                                f.write_all(&file_data).ok();
+                                info!("Wrote additional file: {}", add_file.filename);
+                            }
+                        }
+                    }
+                }
+                
+                // Store the temp path
+                state.loaded_models.insert(model.id, temp_path_str);
+                
+                // Force scene update to load the newly downloaded model
+                last_selected.viewer1_id = None;
+                last_selected.viewer2_id = None;
+            }
+            Err(e) => {
+                error!("Failed to decode base64 for model ID={}: {}", model.id, e);
+            }
+        }
+    }
+}
+
 fn update_scene_on_selection(
     mut commands: Commands,
     mut state: ResMut<ModelState>,
-    upload_state: Res<UploadState>,
+    mut upload_state: ResMut<UploadState>,
     mut last_selected: ResMut<LastSelectedModel>,
     asset_server: Res<AssetServer>,
 ) {
-    let filtered_models: Vec<_> = state.models.iter()
-        .filter(|(_, _, _, file_type)| {
-            upload_state.file_filter == "All" || upload_state.file_filter == *file_type
-        })
+    // Clone the data we need to avoid borrow conflicts
+    let filtered_models: Vec<ModelListItem> = state.available_models.iter()
+        .filter(|m| upload_state.file_filter == "All" || upload_state.file_filter == m.file_type)
         .cloned()
         .collect();
     
@@ -702,33 +840,60 @@ fn update_scene_on_selection(
     if viewer1_should_update {
         info!("Updating Viewer 1 scene, selected: {:?}, filter: {}", upload_state.viewer1_selected_model, upload_state.file_filter);
 
+        // Despawn existing entities
         for (_, entity) in state.viewer1_entities.drain(..) {
-            info!("Despawning entity for Viewer 1");
             commands.entity(entity).despawn();
         }
         state.viewer1_entities.clear();
 
-        let models_to_load = match upload_state.viewer1_selected_model {
+        // Determine which models to display
+        let models_to_load: Vec<ModelListItem> = match upload_state.viewer1_selected_model {
             Some(selected_id) => filtered_models
                 .iter()
-                .filter(|(id, _, _, _)| *id == selected_id)
+                .filter(|m| m.id == selected_id)
                 .cloned()
-                .collect::<Vec<_>>(),
+                .collect(),
             None => filtered_models.clone(),
         };
 
-        for (id, temp_path_str, _name, file_type) in models_to_load {
-            info!("Loading model ID={} ({}) at path {} for Viewer 1", id, file_type, temp_path_str);
-            let entity = commands
-                .spawn((
-                    SceneRoot(asset_server.load(
-                        GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
-                    )),
-                    ViewerLayer::Viewer1,
-                    RenderLayers::layer(0),
-                ))
-                .id();
-            state.viewer1_entities.push((id, entity));
+        // Request models that aren't loaded yet
+        for model in &models_to_load {
+            if !state.loaded_models.contains_key(&model.id) {
+                if !upload_state.pending_model_requests.contains(&model.id) {
+                    info!("Requesting model ID={} from server", model.id);
+                    upload_state.pending_model_requests.push(model.id);
+                    
+                    let request = ModelRequest {
+                        action: "get_by_id".to_string(),
+                        id: Some(model.id),
+                        name: None,
+                        model_data: None,
+                        file_type: None,
+                        additional_files: None,
+                    };
+                    let request_str = serde_json::to_string(&request).unwrap();
+                    if let Err(e) = upload_state.ws_tx.try_send(request_str) {
+                        error!("Failed to request model ID={}: {}", model.id, e);
+                    }
+                }
+            }
+        }
+
+        // Load models that are already downloaded
+        for model in &models_to_load {
+            if let Some(temp_path) = state.loaded_models.get(&model.id) {
+                info!("Loading model ID={} ({}) at path {} for Viewer 1", model.id, model.file_type, temp_path);
+                let entity = commands
+                    .spawn((
+                        SceneRoot(asset_server.load(
+                            GltfAssetLabel::Scene(0).from_asset(temp_path.clone()),
+                        )),
+                        ViewerLayer::Viewer1,
+                        RenderLayers::layer(0),
+                    ))
+                    .id();
+                state.viewer1_entities.push((model.id, entity));
+            }
         }
 
         last_selected.viewer1_id = upload_state.viewer1_selected_model;
@@ -740,33 +905,60 @@ fn update_scene_on_selection(
     if viewer2_should_update {
         info!("Updating Viewer 2 scene, selected: {:?}, filter: {}", upload_state.viewer2_selected_model, upload_state.file_filter);
 
+        // Despawn existing entities
         for (_, entity) in state.viewer2_entities.drain(..) {
-            info!("Despawning entity for Viewer 2");
             commands.entity(entity).despawn();
         }
         state.viewer2_entities.clear();
 
-        let models_to_load = match upload_state.viewer2_selected_model {
+        // Determine which models to display
+        let models_to_load: Vec<ModelListItem> = match upload_state.viewer2_selected_model {
             Some(selected_id) => filtered_models
                 .iter()
-                .filter(|(id, _, _, _)| *id == selected_id)
+                .filter(|m| m.id == selected_id)
                 .cloned()
-                .collect::<Vec<_>>(),
+                .collect(),
             None => filtered_models.clone(),
         };
 
-        for (id, temp_path_str, _name, file_type) in models_to_load {
-            info!("Loading model ID={} ({}) at path {} for Viewer 2", id, file_type, temp_path_str);
-            let entity = commands
-                .spawn((
-                    SceneRoot(asset_server.load(
-                        GltfAssetLabel::Scene(0).from_asset(temp_path_str.clone()),
-                    )),
-                    ViewerLayer::Viewer2,
-                    RenderLayers::layer(1),
-                ))
-                .id();
-            state.viewer2_entities.push((id, entity));
+        // Request models that aren't loaded yet
+        for model in &models_to_load {
+            if !state.loaded_models.contains_key(&model.id) {
+                if !upload_state.pending_model_requests.contains(&model.id) {
+                    info!("Requesting model ID={} from server", model.id);
+                    upload_state.pending_model_requests.push(model.id);
+                    
+                    let request = ModelRequest {
+                        action: "get_by_id".to_string(),
+                        id: Some(model.id),
+                        name: None,
+                        model_data: None,
+                        file_type: None,
+                        additional_files: None,
+                    };
+                    let request_str = serde_json::to_string(&request).unwrap();
+                    if let Err(e) = upload_state.ws_tx.try_send(request_str) {
+                        error!("Failed to request model ID={}: {}", model.id, e);
+                    }
+                }
+            }
+        }
+
+        // Load models that are already downloaded
+        for model in &models_to_load {
+            if let Some(temp_path) = state.loaded_models.get(&model.id) {
+                info!("Loading model ID={} ({}) at path {} for Viewer 2", model.id, model.file_type, temp_path);
+                let entity = commands
+                    .spawn((
+                        SceneRoot(asset_server.load(
+                            GltfAssetLabel::Scene(0).from_asset(temp_path.clone()),
+                        )),
+                        ViewerLayer::Viewer2,
+                        RenderLayers::layer(1),
+                    ))
+                    .id();
+                state.viewer2_entities.push((model.id, entity));
+            }
         }
 
         last_selected.viewer2_id = upload_state.viewer2_selected_model;
@@ -774,99 +966,6 @@ fn update_scene_on_selection(
     
     if last_selected.filter != upload_state.file_filter {
         last_selected.filter = upload_state.file_filter.clone();
-    }
-}
-
-fn handle_model_updates(
-    mut state: ResMut<ModelState>,
-    mut receiver: ResMut<ModelUpdateReceiver>,
-    mut upload_state: ResMut<UploadState>,
-    mut last_selected: ResMut<LastSelectedModel>,
-) {
-    while let Ok(models) = receiver.0.try_recv() {
-        info!("Received {} models, viewer1 selected: {:?}, viewer2 selected: {:?}", 
-              models.len(), upload_state.viewer1_selected_model, upload_state.viewer2_selected_model);
-
-        if !models.is_empty() && upload_state.status == "Upload queued" {
-            upload_state.status = "Upload successful".to_string();
-        }
-
-        let mut new_models = vec![];
-        for model in models {
-            let temp_path = state
-                .models
-                .iter()
-                .find(|(id, _, _, _)| *id == model.id)
-                .map(|(_, path, _, _)| path.clone())
-                .unwrap_or_else(|| {
-                    let temp_dir = std::env::temp_dir();
-                    let model_dir_name = format!("model_{}", model.id);
-                    let model_dir = temp_dir.join(&model_dir_name);
-                    std::fs::create_dir_all(&model_dir).expect("Failed to create model directory");
-                    
-                    let temp_file_name = format!("model_{}.gltf", model.id);
-                    let temp_path = model_dir.join(&temp_file_name);
-                    let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
-
-                    match general_purpose::STANDARD.decode(&model.model_data) {
-                        Ok(model_data) => {
-                            let mut file = File::create(&temp_path).expect("Failed to create temp file");
-                            file.write_all(&model_data).expect("Failed to write temp file");
-                            
-                            if let Some(additional_files) = &model.additional_files {
-                                info!("Writing {} additional files for model ID={}", additional_files.len(), model.id);
-                                for add_file in additional_files {
-                                    if let Ok(file_data) = general_purpose::STANDARD.decode(&add_file.data) {
-                                        let add_path = model_dir.join(&add_file.filename);
-                                        if let Some(parent) = add_path.parent() {
-                                            std::fs::create_dir_all(parent).ok();
-                                        }
-                                        if let Ok(mut f) = File::create(&add_path) {
-                                            f.write_all(&file_data).ok();
-                                            info!("Wrote additional file: {}", add_file.filename);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to decode base64 for model ID={}: {}", model.id, e);
-                        }
-                    }
-                    temp_path_str
-                });
-            new_models.push((model.id, temp_path, model.name, model.file_type));
-        }
-        state.models = new_models;
-
-        last_selected.viewer1_id = None;
-        last_selected.viewer2_id = None;
-
-        if let Some(selected_id) = upload_state.viewer1_selected_model {
-            let filtered_models: Vec<_> = state.models.iter()
-                .filter(|(_, _, _, file_type)| {
-                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
-                })
-                .collect();
-            
-            if !filtered_models.iter().any(|(id, _, _, _)| *id == selected_id) {
-                info!("Viewer 1 selected model ID={} not found in current filter, resetting to All Models", selected_id);
-                upload_state.viewer1_selected_model = None;
-            }
-        }
-        
-        if let Some(selected_id) = upload_state.viewer2_selected_model {
-            let filtered_models: Vec<_> = state.models.iter()
-                .filter(|(_, _, _, file_type)| {
-                    upload_state.file_filter == "All" || upload_state.file_filter == *file_type
-                })
-                .collect();
-            
-            if !filtered_models.iter().any(|(id, _, _, _)| *id == selected_id) {
-                info!("Viewer 2 selected model ID={} not found in current filter, resetting to All Models", selected_id);
-                upload_state.viewer2_selected_model = None;
-            }
-        }
     }
 }
 
