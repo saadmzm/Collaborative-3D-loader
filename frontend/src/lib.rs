@@ -88,6 +88,9 @@ struct ModelListReceiver(mpsc::Receiver<Vec<ModelListItem>>);
 struct ModelDataReceiver(mpsc::Receiver<ModelResponse>);
 
 #[derive(Resource)]
+struct NewModelReceiver(mpsc::Receiver<i32>);
+
+#[derive(Resource)]
 struct UploadState {
     status: String,
     ws_tx: mpsc::Sender<String>,
@@ -108,7 +111,7 @@ struct LastSelectedModel {
     filter: String,
 }
 
-pub fn run() {
+pub fn run() -> AppExit {
     App::new()
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -125,6 +128,7 @@ pub fn run() {
             ui_system,
             handle_model_list_updates,
             handle_model_data_updates,
+            handle_new_model_notifications,
             handle_file_results,
             update_scene_on_selection,
             block_camera_on_egui,
@@ -132,7 +136,7 @@ pub fn run() {
             assign_render_layers,
         ))
         .add_systems(Startup, debug_resources)
-        .run();
+        .run()
 }
 
 fn assign_render_layers(
@@ -173,6 +177,23 @@ fn setup_viewports(
     let window_height = window.physical_height();
 
     match upload_state.view_mode {
+        ViewMode::Single => {
+            for (mut camera, viewer_camera) in cameras.iter_mut() {
+                match viewer_camera {
+                    ViewerCamera::Viewer1 => {
+                        camera.is_active = true;
+                        camera.viewport = Some(Viewport {
+                            physical_position: UVec2::new(0, 0),
+                            physical_size: UVec2::new(window_width, window_height),
+                            ..default()
+                        });
+                    }
+                    ViewerCamera::Viewer2 => {
+                        camera.is_active = false;
+                    }
+                }
+            }
+        }
         ViewMode::Dual => {
             let half_width = window_width / 2;
             
@@ -192,23 +213,6 @@ fn setup_viewports(
                             physical_size: UVec2::new(half_width, window_height),
                             ..default()
                         });
-                    }
-                }
-            }
-        }
-        ViewMode::Single => {
-            for (mut camera, viewer_camera) in cameras.iter_mut() {
-                match viewer_camera {
-                    ViewerCamera::Viewer1 => {
-                        camera.is_active = true;
-                        camera.viewport = Some(Viewport {
-                            physical_position: UVec2::new(0, 0),
-                            physical_size: UVec2::new(window_width, window_height),
-                            ..default()
-                        });
-                    }
-                    ViewerCamera::Viewer2 => {
-                        camera.is_active = false;
                     }
                 }
             }
@@ -274,11 +278,13 @@ fn setup(mut commands: Commands) {
 
     let (list_tx, list_rx) = mpsc::channel(100);
     let (data_tx, data_rx) = mpsc::channel(100);
+    let (new_model_tx, new_model_rx) = mpsc::channel(100);
     let (ws_tx, mut ws_rx) = mpsc::channel(100);
     let (file_tx, file_rx) = mpsc::channel(1);
     
     commands.insert_resource(ModelListReceiver(list_rx));
     commands.insert_resource(ModelDataReceiver(data_rx));
+    commands.insert_resource(NewModelReceiver(new_model_rx));
     commands.insert_resource(UploadState {
         status: "Ready".to_string(),
         ws_tx,
@@ -288,7 +294,7 @@ fn setup(mut commands: Commands) {
         viewer1_selected_model: None,
         viewer2_selected_model: None,
         file_filter: "All".to_string(),
-        view_mode: ViewMode::Single,
+        view_mode: ViewMode::Dual,
         pending_model_requests: Vec::new(),
     });
     commands.insert_resource(LastSelectedModel {
@@ -337,7 +343,28 @@ fn setup(mut commands: Commands) {
                                 Some(message_result) = ws_stream.next() => {
                                     match message_result {
                                         Ok(Message::Text(text)) => {
-                                            // Try parsing as lightweight model list first
+                                            // Try parsing as model list with new_model_id first
+                                            if let Ok(update_msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                                                if let (Some(models_val), Some(new_id)) = (
+                                                    update_msg.get("models"),
+                                                    update_msg.get("new_model_id").and_then(|v| v.as_i64())
+                                                ) {
+                                                    if let Ok(list) = serde_json::from_value::<Vec<ModelListItem>>(models_val.clone()) {
+                                                        // Send both the list and new model ID
+                                                        if let Err(e) = list_tx.send(list).await {
+                                                            error!("Connection {}: Failed to send model list: {}", connection_id, e);
+                                                            break;
+                                                        }
+                                                        // Send notification about new model
+                                                        if let Err(e) = new_model_tx.send(new_id as i32).await {
+                                                            error!("Connection {}: Failed to send new model notification: {}", connection_id, e);
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Try parsing as lightweight model list
                                             if let Ok(list) = serde_json::from_str::<Vec<ModelListItem>>(&text) {
                                                 if let Err(e) = list_tx.send(list).await {
                                                     error!("Connection {}: Failed to send model list: {}", connection_id, e);
@@ -393,6 +420,18 @@ fn setup(mut commands: Commands) {
         });
     });
 }
+
+fn handle_new_model_notifications(
+    mut receiver: ResMut<NewModelReceiver>,
+    mut upload_state: ResMut<UploadState>,
+) {
+    while let Ok(new_model_id) = receiver.0.try_recv() {
+        info!("New model detected with ID: {}, auto-selecting for Viewer 1", new_model_id);
+        upload_state.viewer1_selected_model = Some(new_model_id);
+    }
+}
+
+// Rest of the file remains the same...
 
 fn ui_system(
     mut contexts: EguiContexts,
@@ -578,11 +617,11 @@ fn ui_system(
         .default_pos([640.0, 360.0])
         .show(contexts.ctx_mut(), |ui| {
             ui.horizontal(|ui| {
-                if ui.selectable_label(upload_state.view_mode == ViewMode::Single, "Single View").clicked() {
-                    upload_state.view_mode = ViewMode::Single;
-                }
                 if ui.selectable_label(upload_state.view_mode == ViewMode::Dual, "Dual View").clicked() {
                     upload_state.view_mode = ViewMode::Dual;
+                }
+                if ui.selectable_label(upload_state.view_mode == ViewMode::Single, "Viewer 1").clicked() {
+                    upload_state.view_mode = ViewMode::Single;
                 }
             });
             
