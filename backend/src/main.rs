@@ -3,26 +3,29 @@ use rusqlite::{ params, Connection, Result };
 use serde::{ Deserialize, Serialize };
 use std::{
     collections::HashSet,
-    time::Duration
+    path::PathBuf,
+    time::Duration,
+    env,
 };
 use tokio::{
     net::{ TcpListener, TcpStream },
-    sync::broadcast::{ self, Sender }
+    sync::broadcast::{ self, Sender },
 };
 use tokio_tungstenite::{ accept_async_with_config, tungstenite::Message };
 use base64::{ Engine as _, engine::general_purpose };
 
-// Add this module for Houdini JSON support
 mod houdini_json;
 use houdini_json::HoudiniJsonParser;
+
+mod folder_watcher;
+use folder_watcher::FolderWatcher;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
 struct AdditionalFile {
     filename: String,
-    data: String, // base64-encoded
+    data: String,
 }
 
-// Lightweight model list item (no model_data)
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
 struct ModelListItem {
     id: i32,
@@ -35,40 +38,181 @@ struct ModelRequest {
     action: String,
     id: Option<i32>,
     name: Option<String>,
-    model_data: Option<String>, // base64-encoded model data for insert
-    file_type: Option<String>,  // "gltf" or "houdini_json"
-    additional_files: Option<Vec<AdditionalFile>>, // For GLTF dependencies
+    model_data: Option<String>,
+    file_type: Option<String>,
+    additional_files: Option<Vec<AdditionalFile>>,
 }
 
-// Full model response with data (for get_by_id)
 #[derive(Serialize, Deserialize, Clone)]
 struct ModelResponse {
     id: i32,
     name: Option<String>,
-    model_data: String, // base64-encoded model data
-    file_type: String,  // "gltf" or "houdini_json"
+    model_data: String,
+    file_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    additional_files: Option<Vec<AdditionalFile>>, // For GLTF dependencies
+    additional_files: Option<Vec<AdditionalFile>>,
 }
 
 #[derive(Debug)]
 struct ModelData {
     id: i32,
     name: Option<String>,
-    model_data: Vec<u8>, // raw binary data
-    file_type: String,   // "gltf" or "houdini_json"
-    additional_files: Option<String>, // JSON string of additional files
+    model_data: Vec<u8>,
+    file_type: String,
+    additional_files: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
+    let watch_folder = env::var("MODEL_WATCH_FOLDER")
+        .unwrap_or_else(|_| "frontend/assets".to_string());
+    
+    let watch_path = PathBuf::from(&watch_folder);
+    
+    // Create watched folder if it doesn't exist
+    if !watch_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&watch_path) {
+            eprintln!("Failed to create watch folder: {}", e);
+        } else {
+            println!("Created watch folder: {:?}", watch_path);
+        }
+    }
+
     let listener = TcpListener::bind("127.0.0.1:8000").await.expect("Failed to bind");
     println!("Backend WebSocket server running on ws://127.0.0.1:8000/ws");
     println!("Supported formats: GLTF (.gltf) and Houdini JSON (.json)");
     println!("GLTF files can include external .bin and texture files");
+    println!("Watching folder for new models: {:?}", watch_path);
 
     let (tx, _) = broadcast::channel(16);
 
+    // Setup folder watcher
+    let (file_tx, mut file_rx) = tokio::sync::mpsc::channel(100);
+    let watcher = FolderWatcher::new(watch_path.clone(), file_tx);
+    watcher.start().await;
+
+    // Handle incoming files from watcher
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        while let Some(file_info) = file_rx.recv().await {
+            println!("New file detected: {:?} (type: {})", file_info.path, file_info.file_type);
+            
+            match std::fs::read(&file_info.path) {
+                Ok(data) => {
+                    let mut additional_files = Vec::new();
+                    
+                    // If it's a GLTF file, look for related files
+                    if file_info.file_type == "gltf" {
+                        if let Ok(gltf_text) = std::str::from_utf8(&data) {
+                            if let Ok(gltf_json) = serde_json::from_str::<serde_json::Value>(gltf_text) {
+                                if let Some(parent_dir) = file_info.path.parent() {
+                                    // Find .bin files
+                                    if let Some(buffers) = gltf_json.get("buffers").and_then(|b| b.as_array()) {
+                                        for buffer in buffers {
+                                            if let Some(uri) = buffer.get("uri").and_then(|u| u.as_str()) {
+                                                if !uri.starts_with("data:") {
+                                                    let bin_path = parent_dir.join(uri);
+                                                    if let Ok(bin_data) = std::fs::read(&bin_path) {
+                                                        additional_files.push(AdditionalFile {
+                                                            filename: uri.to_string(),
+                                                            data: general_purpose::STANDARD.encode(&bin_data),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Find texture files
+                                    if let Some(images) = gltf_json.get("images").and_then(|i| i.as_array()) {
+                                        for image in images {
+                                            if let Some(uri) = image.get("uri").and_then(|u| u.as_str()) {
+                                                if !uri.starts_with("data:") {
+                                                    let img_path = parent_dir.join(uri);
+                                                    if let Ok(img_data) = std::fs::read(&img_path) {
+                                                        additional_files.push(AdditionalFile {
+                                                            filename: uri.to_string(),
+                                                            data: general_purpose::STANDARD.encode(&img_data),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Process the file
+                    let final_data = if file_info.file_type == "houdini_json" {
+                        match process_houdini_json(&data) {
+                            Ok(gltf_data) => gltf_data,
+                            Err(e) => {
+                                eprintln!("Failed to process Houdini JSON: {}", e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        data
+                    };
+                    
+                    let additional_files_json = if additional_files.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&additional_files).ok()
+                    };
+                    
+                    // Check if model with this name already exists
+                    match check_model_exists_by_name(&file_info.name) {
+                        Ok(true) => {
+                            println!("Model '{}' already exists in database, skipping", file_info.name);
+                            continue;
+                        }
+                        Ok(false) => {
+                            // Model doesn't exist, proceed with insert
+                        }
+                        Err(e) => {
+                            eprintln!("Error checking model existence: {}", e);
+                            continue;
+                        }
+                    }
+                    
+                    // Insert into database
+                    match insert_model(
+                        &final_data,
+                        Some(&file_info.name),
+                        &file_info.file_type,
+                        additional_files_json.as_deref(),
+                    ) {
+                        Ok(new_id) => {
+                            println!("Model '{}' added to database with ID: {}", file_info.name, new_id);
+                            
+                            // Broadcast update with new model ID marker
+                            match load_all_models_metadata() {
+                                Ok(models) => {
+                                    // Create a special message that includes the new model ID
+                                    let update_msg = serde_json::json!({
+                                        "models": models,
+                                        "new_model_id": new_id
+                                    });
+                                    let update = serde_json::to_string(&update_msg).unwrap();
+                                    if let Err(e) = tx_clone.send(update) {
+                                        eprintln!("Broadcast error: {}", e);
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to load models after auto-insert: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to insert model from watched folder: {}", e),
+                    }
+                }
+                Err(e) => eprintln!("Failed to read file {:?}: {}", file_info.path, e),
+            }
+        }
+    });
+
+    // Existing model list polling
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let mut last_models: HashSet<ModelListItem> = HashSet::new();
@@ -99,8 +243,8 @@ async fn main() {
 
 async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
     let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-    config.max_message_size = Some(100 * 1024 * 1024); // 100 MB
-    config.max_frame_size = Some(100 * 1024 * 1024);   // 100 MB
+    config.max_message_size = Some(100 * 1024 * 1024);
+    config.max_frame_size = Some(100 * 1024 * 1024);
     config.accept_unmasked_frames = false;
     let ws_stream = match accept_async_with_config(stream, Some(config)).await {
         Ok(ws) => ws,
@@ -153,7 +297,6 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                     match load_all_models_metadata() {
                                         Ok(models) => {
                                             let response_str = serde_json::to_string(&models).unwrap();
-                                            println!("Sending model list: {} items, {} bytes", models.len(), response_str.len());
                                             if let Err(e) = write
                                                 .send(Message::Text(response_str.into()))
                                                 .await
@@ -193,9 +336,6 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                                 
                                                 match insert_model(&final_data, request.name.as_deref(), &file_type, additional_files_json.as_deref()) {
                                                     Ok(_new_id) => {
-                                                        println!("Model inserted successfully with {} additional files", 
-                                                            request.additional_files.as_ref().map(|f| f.len()).unwrap_or(0));
-                                                        // Send lightweight model list
                                                         match load_all_models_metadata() {
                                                             Ok(models) => {
                                                                 let update = serde_json::to_string(&models).unwrap();
@@ -230,11 +370,9 @@ async fn handle_connection(stream: TcpStream, tx: Sender<String>) {
                                     if let Some(id) = request.id {
                                         match delete_model(id) {
                                             Ok(()) => {
-                                                // Send lightweight model list
                                                 match load_all_models_metadata() {
                                                     Ok(models) => {
                                                         let update = serde_json::to_string(&models).unwrap();
-                                                        println!("Broadcasting model list after delete: {} models", models.len());
                                                         if let Err(e) = tx.send(update.clone()) {
                                                             eprintln!("Broadcast error: {:?}", e);
                                                         }
@@ -342,39 +480,7 @@ fn process_houdini_json(data: &[u8]) -> Result<Vec<u8>, String> {
 fn init_db() -> Result<Connection> {
     let conn = Connection::open("models.db")?;
     
-    conn.execute(
-        "ALTER TABLE models ADD COLUMN additional_files TEXT",
-        params![],
-    )
-    .unwrap_or_else(|e| {
-        if !e.to_string().contains("duplicate column name") {
-            panic!("Failed to add additional_files column: {}", e);
-        }
-        0
-    });
-    
-    conn.execute(
-        "ALTER TABLE models ADD COLUMN file_type TEXT DEFAULT 'gltf'",
-        params![],
-    )
-    .unwrap_or_else(|e| {
-        if !e.to_string().contains("duplicate column name") {
-            panic!("Failed to add file_type column: {}", e);
-        }
-        0
-    });
-    
-    conn.execute(
-        "ALTER TABLE models ADD COLUMN Name TEXT",
-        params![],
-    )
-    .unwrap_or_else(|e| {
-        if !e.to_string().contains("duplicate column name") {
-            panic!("Failed to add Name column: {}", e);
-        }
-        0
-    });
-    
+    // Create table first if it doesn't exist
     conn.execute(
         "CREATE TABLE IF NOT EXISTS models (
             id INTEGER PRIMARY KEY,
@@ -386,10 +492,25 @@ fn init_db() -> Result<Connection> {
         params![],
     )?;
     
+    // Then try to add columns if they don't exist (for legacy databases)
+    let _ = conn.execute(
+        "ALTER TABLE models ADD COLUMN additional_files TEXT",
+        params![],
+    );
+    
+    let _ = conn.execute(
+        "ALTER TABLE models ADD COLUMN file_type TEXT DEFAULT 'gltf'",
+        params![],
+    );
+    
+    let _ = conn.execute(
+        "ALTER TABLE models ADD COLUMN Name TEXT",
+        params![],
+    );
+    
     Ok(conn)
 }
 
-// New function: Load only metadata (no model_data)
 fn load_all_models_metadata() -> Result<Vec<ModelListItem>> {
     let conn = init_db()?;
     let mut stmt = conn.prepare("SELECT id, Name, COALESCE(file_type, 'gltf') FROM models")?;
@@ -438,4 +559,11 @@ fn delete_model(model_id: i32) -> Result<()> {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
     Ok(())
+}
+
+fn check_model_exists_by_name(name: &str) -> Result<bool> {
+    let conn = init_db()?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM models WHERE Name = ?1")?;
+    let count: i32 = stmt.query_row(params![name], |row| row.get(0))?;
+    Ok(count > 0)
 }
