@@ -445,6 +445,7 @@ fn ui_system(
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut upload_state.file_filter, "All".to_string(), "All Files");
                 ui.selectable_value(&mut upload_state.file_filter, "gltf".to_string(), "GLTF Files");
+                ui.selectable_value(&mut upload_state.file_filter, "glb".to_string(), "GLB Files");
                 ui.selectable_value(&mut upload_state.file_filter, "houdini_json".to_string(), "Houdini JSON Files");
             });
         
@@ -464,11 +465,12 @@ fn ui_system(
                     .map_or_else(|| format!("Model {}", model.id), |n| n.clone());
                 let file_type_display = match model.file_type.as_str() {
                     "gltf" => "GLTF",
+                    "glb" => "GLB",
                     "houdini_json" => "Houdini",
                     _ => "Unknown"
                 };
                 let loaded_indicator = if state.loaded_models.contains_key(&model.id) {
-                    "✓"
+                    "âœ“"
                 } else {
                     " "
                 };
@@ -574,6 +576,34 @@ fn ui_system(
                     }
                 }
                 
+                if ui.button("Choose GLB File").clicked() {
+                    if upload_state.status != "Uploading..." {
+                        upload_state.status = "Uploading...".to_string();
+                        let file_tx = upload_state.file_tx.clone();
+                        std::thread::spawn(move || {
+                            let (path_str, result) = if let Some(path) = FileDialog::new()
+                                .add_filter("GLB Files", &["glb"])
+                                .pick_file()
+                            {
+                                let path_str = path.to_string_lossy().to_string();
+                                let file_name = Path::new(&path_str)
+                                    .file_stem()
+                                    .and_then(|stem| stem.to_str())
+                                    .map(|s| s.to_string());
+                                match std::fs::read(&path) {
+                                    Ok(data) => (path_str, Ok((data, file_name, "glb".to_string(), Vec::new()))),
+                                    Err(e) => (path_str, Err(format!("Failed to read file: {}", e))),
+                                }
+                            } else {
+                                ("".to_string(), Err("No file selected".to_string()))
+                            };
+                            if let Err(e) = file_tx.blocking_send((path_str, result)) {
+                                error!("Failed to send file result: {}", e);
+                            }
+                        });
+                    }
+                }
+                
                 if ui.button("Choose Houdini JSON").clicked() {
                     if upload_state.status != "Uploading..." {
                         upload_state.status = "Uploading...".to_string();
@@ -610,6 +640,7 @@ fn ui_system(
             ui.label("Supported Formats:");
             ui.label("• GLTF (.gltf) - Standard 3D format");
             ui.label("  (Automatically includes .bin & textures)");
+            ui.label("• GLB (.glb) - Binary 3D format (self-contained)");
             ui.label("• Houdini JSON (.json) - Geometry from Houdini");
         });
 
@@ -640,6 +671,7 @@ fn ui_system(
                     .map(|m| {
                         let file_prefix = match m.file_type.as_str() {
                             "gltf" => "[GLTF]",
+                            "glb" => "[GLB]",
                             "houdini_json" => "[Houdini]",
                             _ => "[Unknown]"
                         };
@@ -656,6 +688,7 @@ fn ui_system(
                     for model in &filtered_models {
                         let file_prefix = match model.file_type.as_str() {
                             "gltf" => "[GLTF]",
+                            "glb" => "[GLB]",
                             "houdini_json" => "[Houdini]",
                             _ => "[Unknown]"
                         };
@@ -677,6 +710,7 @@ fn ui_system(
                         .map(|m| {
                             let file_prefix = match m.file_type.as_str() {
                                 "gltf" => "[GLTF]",
+                                "glb" => "[GLB]",
                                 "houdini_json" => "[Houdini]",
                                 _ => "[Unknown]"
                             };
@@ -693,6 +727,7 @@ fn ui_system(
                         for model in &filtered_models {
                             let file_prefix = match model.file_type.as_str() {
                                 "gltf" => "[GLTF]",
+                                "glb" => "[GLB]",
                                 "houdini_json" => "[Houdini]",
                                 _ => "[Unknown]"
                             };
@@ -820,7 +855,12 @@ fn handle_model_data_updates(
         let model_dir = temp_dir.join(&model_dir_name);
         std::fs::create_dir_all(&model_dir).expect("Failed to create model directory");
         
-        let temp_file_name = format!("model_{}.gltf", model.id);
+        // Use the correct file extension based on the file type
+        let file_extension = match model.file_type.as_str() {
+            "glb" => "glb",
+            _ => "gltf", // Default to gltf for both "gltf" and "houdini_json" (converted to gltf)
+        };
+        let temp_file_name = format!("model_{}.{}", model.id, file_extension);
         let temp_path = model_dir.join(&temp_file_name);
         let temp_path_str = temp_path.to_str().expect("Invalid temp path").to_string();
         

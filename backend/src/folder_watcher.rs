@@ -135,6 +135,7 @@ impl FolderWatcher {
         let extension = path.extension()?.to_str()?;
         let file_type = match extension.to_lowercase().as_str() {
             "gltf" => "gltf",
+            "glb" => "glb",
             "json" => {
                 // Check if it's a Houdini JSON by reading the file
                 if let Ok(content) = std::fs::read_to_string(path) {
