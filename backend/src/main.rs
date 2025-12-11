@@ -80,8 +80,9 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:8000").await.expect("Failed to bind");
     println!("Backend WebSocket server running on ws://127.0.0.1:8000/ws");
-    println!("Supported formats: GLTF (.gltf) and Houdini JSON (.json)");
+    println!("Supported formats: GLTF (.gltf), GLB (.glb), and Houdini JSON (.json)");
     println!("GLTF files can include external .bin and texture files");
+    println!("GLB files are self-contained binary format");
     println!("Watching folder for new models: {:?}", watch_path);
 
     let (tx, _) = broadcast::channel(16);
@@ -101,7 +102,7 @@ async fn main() {
                 Ok(data) => {
                     let mut additional_files = Vec::new();
                     
-                    // If it's a GLTF file, look for related files
+                    // If it's a GLTF file, look for related files (GLB is self-contained)
                     if file_info.file_type == "gltf" {
                         if let Ok(gltf_text) = std::str::from_utf8(&data) {
                             if let Ok(gltf_json) = serde_json::from_str::<serde_json::Value>(gltf_text) {
@@ -434,6 +435,12 @@ where
 }
 
 fn detect_file_type(data: &[u8]) -> String {
+    // Check for GLB binary format (starts with "glTF" magic number)
+    if data.len() >= 4 && &data[0..4] == b"glTF" {
+        return "glb".to_string();
+    }
+    
+    // Check for GLTF JSON format
     if let Ok(text) = std::str::from_utf8(data) {
         let trimmed = text.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
@@ -444,10 +451,6 @@ fn detect_file_type(data: &[u8]) -> String {
                 return "gltf".to_string();
             }
         }
-    }
-    
-    if data.len() >= 4 && &data[0..4] == b"glTF" {
-        return "gltf".to_string();
     }
     
     "gltf".to_string()
