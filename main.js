@@ -1,3 +1,7 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
 // Scene setup
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
@@ -6,7 +10,7 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
 // Lighting
-const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
 scene.add(ambientLight);
 const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
 directionalLight.position.set(5, 5, 5);
@@ -24,12 +28,12 @@ scene.add(spotLight.target);
 camera.position.set(0, 2, 5);
 
 // Orbit controls
-const controls = new THREE.OrbitControls(camera, renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.05;
 
 // glTF loader
-const loader = new THREE.GLTFLoader();
+const loader = new GLTFLoader();
 let currentModels = [];
 
 // WebSocket setup
@@ -79,8 +83,18 @@ ws.onmessage = (event) => {
             console.log('Server error:', data.error);
             statusDiv.textContent = `Error: ${data.error}`;
             statusDiv.style.color = 'red';
+        } else if (data.models && Array.isArray(data.models)) {
+            // Handle new model notification with model list update
+            console.log('Received model list with new model notification:', data);
+            allModels = data.models;
+            updateModelSelect(data.models);
+            if (data.new_model_id) {
+                console.log('New model added with ID:', data.new_model_id);
+            }
+            // Update scene based on current selection
+            updateScene();
         } else if (Array.isArray(data)) {
-            // Handle get_all response
+            // Handle get_all response (plain array)
             console.log('Received model list:', data);
             allModels = data;
             updateModelSelect(data);
@@ -89,9 +103,9 @@ ws.onmessage = (event) => {
         } else if (data.id && data.model_data) {
             // Handle get_by_id response
             console.log('Received model:', data);
-            if (modelSelect.value == data.id) { // Ensure the response matches the selected model
-                loadModelFromResponse([data], true);
-            }
+            // Check if we're loading all models or just one
+            const isLoadingAll = modelSelect.value === 'all';
+            loadModelFromResponse([data], !isLoadingAll); // Only clear scene if not loading all
         } else {
             console.log('Unexpected response format:', data);
             statusDiv.textContent = 'Unexpected server response';
@@ -118,10 +132,12 @@ function updateModelSelect(models) {
         return;
     }
     models.forEach((model) => {
-        if (model.id && model.model_data) {
+        // Model list items only have id, name, and file_type (no model_data)
+        if (model.id) {
             const option = document.createElement('option');
             option.value = model.id;
-            option.textContent = model.name ? `${model.name} (ID: ${model.id})` : `Model ID: ${model.id}`;
+            const fileType = model.file_type ? `[${model.file_type.toUpperCase()}]` : '';
+            option.textContent = model.name ? `${fileType} ${model.name} (ID: ${model.id})` : `${fileType} Model ID: ${model.id}`;
             modelSelect.appendChild(option);
         } else {
             console.log('Skipping invalid model:', model);
@@ -155,39 +171,56 @@ function loadModelFromResponse(models, clearScene = false) {
             for (let i = 0; i < len; i++) {
                 bytes[i] = binaryString.charCodeAt(i);
             }
-            const arrayBuffer = bytes.buffer;
+            
+            // Create blob with proper MIME type
+            const mimeType = model.file_type === 'glb' ? 'model/gltf-binary' : 'model/gltf+json';
+            const blob = new Blob([bytes], { type: mimeType });
+            const url = URL.createObjectURL(blob);
+            
+            // Use load() instead of parse() - this properly handles embedded resources
+            loader.load(
+                url,
+                (gltf) => {
+                    const modelScene = gltf.scene;
+                    modelScene.position.set(index * 3, 0, 0);
+                    scene.add(modelScene);
+                    currentModels.push(modelScene);
+                    loadedCount++;
+                    
+                    // Clean up blob URL
+                    URL.revokeObjectURL(url);
 
-            loader.parse(arrayBuffer, '', (gltf) => {
-                const modelScene = gltf.scene;
-                modelScene.position.set(index * 3, 0, 0);
-                scene.add(modelScene);
-                currentModels.push(modelScene);
-                loadedCount++;
+                    const box = new THREE.Box3();
+                    currentModels.forEach(m => box.expandByObject(m));
+                    const center = box.getCenter(new THREE.Vector3());
+                    const size = box.getSize(new THREE.Vector3());
+                    const maxDim = Math.max(size.x, size.y, size.z, 5);
+                    camera.position.set(center.x, center.y, center.z + maxDim * 2);
+                    controls.target = center;
+                    spotLight.target.position.copy(center);
 
-                const box = new THREE.Box3();
-                currentModels.forEach(m => box.expandByObject(m));
-                const center = box.getCenter(new THREE.Vector3());
-                const size = box.getSize(new THREE.Vector3());
-                const maxDim = Math.max(size.x, size.y, size.z, 5);
-                camera.position.set(center.x, center.y, center.z + maxDim * 2);
-                controls.target = center;
-                spotLight.target.position.copy(center);
-
-                if (loadedCount === totalModels) {
-                    statusDiv.textContent = `Loaded ${totalModels} model${totalModels > 1 ? 's' : ''}`;
-                    statusDiv.style.color = 'green';
-                    console.log('All models loaded successfully');
+                    if (loadedCount === totalModels) {
+                        statusDiv.textContent = `Loaded ${totalModels} model${totalModels > 1 ? 's' : ''}`;
+                        statusDiv.style.color = 'green';
+                        console.log('All models loaded successfully');
+                    }
+                },
+                undefined,
+                (error) => {
+                    statusDiv.textContent = `Error loading model ID: ${model.id}`;
+                    statusDiv.style.color = 'red';
+                    console.error(`Error loading glTF/GLB for ID ${model.id}:`, error);
+                    
+                    // Clean up blob URL on error
+                    URL.revokeObjectURL(url);
+                    
+                    loadedCount++;
+                    if (loadedCount === totalModels) {
+                        statusDiv.textContent = `Loaded ${totalModels} model${totalModels > 1 ? 's' : ''} with errors`;
+                        statusDiv.style.color = 'orange';
+                    }
                 }
-            }, (error) => {
-                statusDiv.textContent = `Error loading model ID: ${model.id}`;
-                statusDiv.style.color = 'red';
-                console.error(`Error loading glTF for ID ${model.id}:`, error);
-                loadedCount++;
-                if (loadedCount === totalModels) {
-                    statusDiv.textContent = `Loaded ${totalModels} model${totalModels > 1 ? 's' : ''} with errors`;
-                    statusDiv.style.color = 'orange';
-                }
-            });
+            );
         } catch (e) {
             statusDiv.textContent = `Error decoding model data for ID: ${model.id}`;
             statusDiv.style.color = 'red';
@@ -212,9 +245,21 @@ function updateScene() {
             currentModels = [];
             return;
         }
-        console.log('Loading all models:', allModels);
-        loadModelFromResponse(allModels, true);
-        statusDiv.textContent = 'Requesting all models...';
+        console.log('Requesting all models:', allModels);
+        statusDiv.textContent = `Requesting all ${allModels.length} models...`;
+        
+        // Clear current models
+        currentModels.forEach(model => scene.remove(model));
+        currentModels = [];
+        
+        // Request each model individually
+        allModels.forEach((modelItem, index) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                const getByIdRequest = { action: 'get_by_id', id: modelItem.id };
+                console.log(`Requesting model ${index + 1}/${allModels.length}, ID:`, modelItem.id);
+                ws.send(JSON.stringify(getByIdRequest));
+            }
+        });
     } else if (modelId) {
         const modelIdNum = parseInt(modelId);
         if (!isNaN(modelIdNum) && modelIdNum > 0 && ws.readyState === WebSocket.OPEN) {
