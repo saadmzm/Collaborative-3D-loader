@@ -30,6 +30,36 @@
             margin-top: 10px;
             font-size: 12px;
         }
+        #lightingControls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            width: 250px;
+        }
+        #lightingControls h3 {
+            margin: 0 0 10px 0;
+            font-size: 14px;
+        }
+        .light-control {
+            margin-bottom: 15px;
+        }
+        .light-control label {
+            display: block;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        .light-control input[type="range"] {
+            width: 100%;
+        }
+        .light-control-value {
+            font-size: 11px;
+            color: #aaa;
+            float: right;
+        }
     </style>
 </head>
 <body>
@@ -40,6 +70,36 @@
         </select>
         <div id="status">Disconnected</div>
     </div>
+    
+    <div id="lightingControls">
+        <h3>Lighting Controls</h3>
+        
+        <div class="light-control">
+            <label>Ambient Light <span class="light-control-value" id="ambientValue">0.5</span></label>
+            <input type="range" id="ambientIntensity" min="0" max="2" step="0.1" value="0.5">
+        </div>
+        
+        <div class="light-control">
+            <label>Directional Light <span class="light-control-value" id="directionalValue">0.5</span></label>
+            <input type="range" id="directionalIntensity" min="0" max="2" step="0.1" value="0.5">
+        </div>
+        
+        <div class="light-control">
+            <label>Point Light <span class="light-control-value" id="pointValue">1.0</span></label>
+            <input type="range" id="pointIntensity" min="0" max="3" step="0.1" value="1">
+        </div>
+        
+        <div class="light-control">
+            <label>Spot Light <span class="light-control-value" id="spotValue">1.0</span></label>
+            <input type="range" id="spotIntensity" min="0" max="3" step="0.1" value="1">
+        </div>
+        
+        <div class="light-control">
+            <label>Background <span class="light-control-value" id="bgValue">#000000</span></label>
+            <input type="color" id="backgroundColor" value="#000000">
+        </div>
+    </div>
+    
     <script type="importmap">
         {
             "imports": {

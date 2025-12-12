@@ -10,7 +10,7 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
 // Lighting
-const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
 scene.add(ambientLight);
 const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
 directionalLight.position.set(5, 5, 5);
@@ -295,6 +295,32 @@ function updateScene() {
 modelSelect.addEventListener('change', () => {
     console.log('Dropdown selection changed to:', modelSelect.value);
     updateScene();
+});
+
+// Lighting controls
+document.getElementById('ambientIntensity').addEventListener('input', (e) => {
+    ambientLight.intensity = parseFloat(e.target.value);
+    document.getElementById('ambientValue').textContent = e.target.value;
+});
+
+document.getElementById('directionalIntensity').addEventListener('input', (e) => {
+    directionalLight.intensity = parseFloat(e.target.value);
+    document.getElementById('directionalValue').textContent = e.target.value;
+});
+
+document.getElementById('pointIntensity').addEventListener('input', (e) => {
+    pointLight.intensity = parseFloat(e.target.value);
+    document.getElementById('pointValue').textContent = e.target.value;
+});
+
+document.getElementById('spotIntensity').addEventListener('input', (e) => {
+    spotLight.intensity = parseFloat(e.target.value);
+    document.getElementById('spotValue').textContent = e.target.value;
+});
+
+document.getElementById('backgroundColor').addEventListener('input', (e) => {
+    scene.background = new THREE.Color(e.target.value);
+    document.getElementById('bgValue').textContent = e.target.value;
 });
 
 window.addEventListener('resize', () => {
