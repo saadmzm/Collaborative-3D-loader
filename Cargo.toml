@@ -2,6 +2,3 @@
 members = ["frontend", "backend"]
 resolver = "2"
 package.authors = ["Saad Moazzam"]
-
-[profile.release]
-opt-level = 3
